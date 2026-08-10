@@ -86,6 +86,7 @@ def build_wide_features(
         y_in_sample=train_clean[["target"]] * target_scale,
         DANGEROUS_r_next_in_sample=r_next_train.loc[train_clean.index],
         id_cols=None,
+        id_cols_last_index=None,
     )
     forecast_feature = ForecastFeature(
         start=calendar.forecast_start, end=calendar.forecast_end,
@@ -184,6 +185,7 @@ def build_long_features(
         y_in_sample=train_clean[["target"]].assign(target=train_clean["target"] * target_scale),
         DANGEROUS_r_next_in_sample=train_clean["r_next"],
         id_cols=train_clean[id_cols_list],
+        id_cols_last_index=train_last[id_cols_list],
     )
     forecast_feature = ForecastFeature(
         start=calendar.forecast_start, end=calendar.forecast_end,

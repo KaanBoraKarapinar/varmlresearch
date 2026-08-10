@@ -33,6 +33,9 @@ class TrainingFeature(NamedTuple):
     #only for long format
     id_cols: pd.DataFrame | None
 
+    # only for long format -- Date/ticker per row of X_out_sample_last_index (parallel to id_cols, which only covers X_in_sample)
+    id_cols_last_index: pd.DataFrame | None
+
 
 class ForecastFeature(NamedTuple):
     start: pd.Timestamp
@@ -47,7 +50,7 @@ class ForecastFeature(NamedTuple):
     X_forecast_sample: pd.DataFrame
     y_forecast_sample: pd.DataFrame
 
-    DANGEROUS_r_next_out_sample: pd.Series
+    DANGEROUS_r_next_forecast_sample: pd.Series
 
     # only for long format
     id_cols: pd.DataFrame | None
@@ -443,6 +446,25 @@ class ResidualBank:
         self._current_single_stateful_mu = float(window["actual_return"].mean())
         return self
 
+    def bulk_load(self, dates, actual_returns, predicted_variances, window_size: int) -> "ResidualBank":
+        """
+        Seeds a bank from scratch, one bar at a time: step_1 adds the residual using
+        whatever mu_hat has accumulated so far (starting from initial_mu_hat), then
+        step_2 refreshes mu_hat from up to the last window_size bars now available.
+        No-look-ahead throughout, same as step_1/step_2 -- but unlike
+        bulk_insert_respecting_order, it never requires window_size bars of PRIOR
+        history to already exist (windowed_read tolerates a partial window), so this
+        is the one that works on a freshly empty bank. Use bulk_insert_respecting_order
+        instead once the bank already has real history to roll a full window over.
+        """
+        dates = pd.DatetimeIndex(dates, name="Date")
+        actual_returns = np.asarray(actual_returns, dtype=float)
+        predicted_variances = np.asarray(predicted_variances, dtype=float)
+        for date, actual_return, predicted_variance in zip(dates, actual_returns, predicted_variances):
+            self.step_1_add_residual_with_prev_stateful_mu(date, actual_return, predicted_variance)
+            self.step_2_change_stateful_mu(window_size, as_of=date)
+        return self
+
     def bulk_insert_respecting_order(self, dates, actual_returns, predicted_variances,
                                      window_size: int) -> "ResidualBank":
         """
@@ -604,6 +626,7 @@ class TrainedModel(ABC):
         target_scale: float,
         feature_cols: list[str],
         residual_bank_in_sample: ResidualBank,
+        ewma_variance_bank_in_sample: "EwmaVarianceBank | None" = None,
     ):
         self.training_feature = training_feature
         self.underlying_model = underlying_model
@@ -611,14 +634,40 @@ class TrainedModel(ABC):
         self.target_scale = target_scale
         self.feature_cols = feature_cols
         self.residual_bank_in_sample = residual_bank_in_sample
+        self.ewma_variance_bank_in_sample = ewma_variance_bank_in_sample
 
     @abstractmethod
-    def predict_variance(self, forecast_feature: "ForecastFeature", feature_date: pd.Timestamp) -> float:
-        """Predict the variance for the bar immediately AFTER feature_date."""
+    def predict_variance_single_wide(self, forecast_feature: "ForecastFeature", feature_date: pd.Timestamp) -> float:
+        """Predict the variance for the bar immediately AFTER feature_date (wide/single-ticker feature)."""
 
     @abstractmethod
-    def predict_variance_batch(self, forecast_feature: "ForecastFeature", feature_dates: pd.Timestamp) -> float:
-        """Predict the variances for the given feature dates ."""
+    def predict_variance_batch_wide(self, forecast_feature: "ForecastFeature", feature_dates: pd.Timestamp) -> pd.Series:
+        """Predict the variances for the given feature dates (wide/single-ticker feature)."""
+
+    def predict_variance_batch_long(
+        self, X_long: pd.DataFrame, id_cols: pd.DataFrame, feature_dates
+    ) -> dict[str, pd.Series]:
+        """
+        Splits a long-format (one row per (Date, ticker)) feature block into one
+        date-indexed wide view per ticker via id_cols, and scores each with
+        predict_variance_batch_wide. Concrete on the base class -- every
+        subclass gets this for free by implementing predict_variance_batch_wide.
+        """
+        feature_dates = pd.DatetimeIndex(feature_dates)
+        result: dict[str, pd.Series] = {}
+        for ticker, rows in id_cols.groupby("ticker").groups.items():
+            ticker_X = X_long.loc[rows, self.feature_cols].set_axis(
+                id_cols.loc[rows, "Date"].to_numpy(), axis=0
+            ).sort_index()
+            ticker_view = ForecastFeature(
+                start=self.training_feature.start, end=self.training_feature.end,
+                target_scale=self.target_scale, frequency=self.training_feature.frequency,
+                feature_cols=self.feature_cols, type="wide",
+                X_forecast_sample=ticker_X, y_forecast_sample=pd.DataFrame(),
+                DANGEROUS_r_next_forecast_sample=pd.Series(dtype=float), id_cols=None,
+            )
+            result[ticker] = self.predict_variance_batch_wide(ticker_view, feature_dates)
+        return result
 
 
 class ForecastResult(NamedTuple):
@@ -640,169 +689,183 @@ def multi_day_var_from_pretrained_model(
     calendar: GroundTruthCalendar,
     window_size: int,
     var_confidence: float,
+    run_key: str | None = None,
 ) -> pd.DataFrame:
     """
     forecast_dates is no longer a parameter, calendar.forecast_dates is the
-    single source of truth for which bars get scored.
+    single source of truth for which bars get scored. calendar.forecast_data's
+    index IS calendar.forecast_dates by construction, so actual returns/losses
+    are read straight off it -- no train_data ever touched here.
+
+    feature_dates/outcome_dates are paired by POSITION (forecast_dates[i-1] is
+    the feature bar for forecast_dates[i]), not by subtracting calendar.frequency
+    -- a calendar-day subtraction lands on a non-trading day (weekend, or any
+    holiday skipped inside the forecast window) and would KeyError. This also
+    means forecast_dates[0] itself is never scored here: its feature bar is the
+    last TRAINING bar, which forecast_feature doesn't carry.
     """
     bank = trained_model.residual_bank_in_sample.copy()
     forecast_dates = calendar.forecast_dates
 
-    if len(forecast_dates) == 0:
+    if len(forecast_dates) < 2:
         return pd.DataFrame(columns=["varForecast", "loss"])
 
-    feature_dates = forecast_dates - calendar.frequency
-    predicted_variances = trained_model.predict_variance_batch(forecast_feature, feature_dates)
-    predicted_variances.index = forecast_dates
+    feature_dates = forecast_dates[:-1]
+    outcome_dates = forecast_dates[1:]
+    predicted_variances = trained_model.predict_variance_batch_wide(forecast_feature, feature_dates)
+    predicted_variances.index = outcome_dates
 
-    actual_returns = np.array([calendar.realized_return(d) for d in forecast_dates])
+    actual_returns = calendar.forecast_data.loc[outcome_dates, "portfolio_return"].to_numpy()
 
-    bank.bulk_insert_respecting_order(forecast_dates, actual_returns, predicted_variances.to_numpy(), window_size)
+    bank.bulk_insert_respecting_order(outcome_dates, actual_returns, predicted_variances.to_numpy(), window_size)
 
-    var_df = bank.multi_day_var(forecast_dates, var_confidence, window_size)
-    var_df["loss"] = [calendar.realized_loss(d) for d in var_df.index]
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, window_size)
+    var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
 
-    for date, var_estimate in var_df["varForecast"].items():
-        calendar.add_predicted_var(date, var_estimate)
-
-    return var_df
-
-
-def multi_day_var_from_long_format_model(
-    pooled_model: TrainedModel,
-    calendar: GroundTruthCalendar,
-    per_ticker_forecast_feature: dict[str, "ForecastFeature"],
-    window_size: int,
-    var_confidence: float,
-    initial_residual_bank: ResidualBank,
-    ewma_lam: float = 0.94,
-    ewma_min_periods: int = 30,
-) -> pd.DataFrame:
-    bank = initial_residual_bank.copy()
-    forecast_dates = calendar.forecast_dates
-
-    if len(forecast_dates) == 0:
-        return pd.DataFrame(columns=["varForecast", "loss"])
-
-    feature_dates = forecast_dates - calendar.frequency
-    predicted_variances = predict_portfolio_variance_batch_with_ewma(
-        pooled_model, calendar, per_ticker_forecast_feature, feature_dates, ewma_lam, ewma_min_periods
-    )
-    predicted_variances.index = forecast_dates
-
-    actual_returns = np.array([calendar.realized_return(d) for d in forecast_dates])
-
-    bank.bulk_insert_respecting_order(forecast_dates, actual_returns, predicted_variances.to_numpy(), window_size)
-
-    var_df = bank.multi_day_var(forecast_dates, var_confidence, window_size)
-    var_df["loss"] = [calendar.realized_loss(d) for d in var_df.index]
-
-    for date, var_estimate in var_df["varForecast"].items():
-        calendar.add_predicted_var(date, var_estimate)
+    calendar.add_predicted_var_batch(run_key or trained_model.model_name, var_df["varForecast"])
 
     return var_df
 
 # %%
 
-def _build_ewma_cov_by_date(returns_df: pd.DataFrame, lam: float = 0.94, min_periods: int = 30) -> dict[pd.Timestamp, np.ndarray]:
-    """RiskMetrics-style rolling EWMA covariance. Date t's matrix uses returns up to t-1 only."""
-    R = returns_df.to_numpy(dtype=float)
-    dates = returns_df.index
-
-    sigma = np.atleast_2d(np.cov(R[:min_periods], rowvar=False))
-
-    cov_by_date = {}
-    for t in range(min_periods, len(R)):
-        r_prev = R[t - 1]  # last realized return, valid one-step-ahead for date t
-        sigma = lam * sigma + (1 - lam) * np.outer(r_prev, r_prev)
-        cov_by_date[dates[t]] = sigma.copy()
-    return cov_by_date
-
-
-def _correlation_at(cov_by_date: dict[pd.Timestamp, np.ndarray], date, ewma_min_periods: int) -> np.ndarray:
-    date = pd.Timestamp(date)
-    if date not in cov_by_date:
-        raise KeyError(f"No EWMA covariance at {date} (min_periods={ewma_min_periods} not reached, or date out of range).")
-    sigma = cov_by_date[date]
-    d = np.sqrt(np.diag(sigma))
-    d[d == 0] = np.nan
-    corr = sigma / np.outer(d, d)
-    np.fill_diagonal(corr, 1.0)
-    return corr
-
-
-def predict_portfolio_variance_batch_with_ewma(
-    pooled_model: TrainedModel,
-    calendar: GroundTruthCalendar,
-    per_ticker_forecast_feature: dict[str, "ForecastFeature"],
-    feature_dates,
-    ewma_lam: float = 0.94,
-    ewma_min_periods: int = 30,
-) -> pd.Series:
+class EwmaVarianceBank:
     """
-    Diagonal (per-ticker variance) from pooled_model, off-diagonal (correlation)
-    from EWMA on calendar.ticker_returns. Portfolio variance = w^T Sigma w.
+    Portfolio-variance bank for pooled long-format models: diagonal (per-ticker
+    variance) comes from the ML model, off-diagonal (correlation) from a
+    RiskMetrics-style EWMA on raw ticker returns. Portfolio variance is the
+    full quadratic form w^T Sigma_hat w.
+
+    Mirrors ResidualBank's lifecycle exactly: seed_covariance()+add() during
+    training builds the *_in_sample bank, then .copy() carries it into the
+    forecast phase where add()/bulk_add() keep extending it one date at a time.
+
+    No-look-ahead by construction: add(date, ...) rolls the EWMA covariance
+    forward using the PREVIOUS call's return (self._prev_return), never the
+    return being recorded in the same call -- same discipline as ResidualBank's
+    stateful mu_hat.
     """
-    feature_dates = pd.DatetimeIndex(feature_dates)
 
-    missing_tickers = set(calendar.tickers) - set(per_ticker_forecast_feature.keys())
-    if missing_tickers:
-        raise KeyError(f"per_ticker_forecast_feature missing tickers: {sorted(missing_tickers)}")
+    def __init__(self, tickers: list[str], weights: pd.Series, ewma_lam: float = 0.94, ewma_min_periods: int = 30):
+        self.tickers = list(tickers)
+        self.weights = weights.loc[self.tickers].to_numpy()
+        self.ewma_lam = ewma_lam
+        self.ewma_min_periods = ewma_min_periods
 
-    cov_by_date = _build_ewma_cov_by_date(calendar.ticker_returns, lam=ewma_lam, min_periods=ewma_min_periods)
+        self.ticker_returns = pd.DataFrame(columns=self.tickers, index=pd.DatetimeIndex([], name="Date"))
+        self.sigma_diag = pd.DataFrame(columns=self.tickers, index=pd.DatetimeIndex([], name="Date"))
+        self.portfolio_variance = pd.Series(dtype=float, name="predicted_variance")
+        self.cov_by_date: dict[pd.Timestamp, np.ndarray] = {}
 
-    diag_by_ticker = {
-        t: pooled_model.predict_variance_batch(per_ticker_forecast_feature[t], feature_dates)
-        for t in calendar.tickers
-    }
+        self._current_sigma: np.ndarray | None = None
+        self._prev_return: np.ndarray | None = None
 
-    w = calendar.weights.loc[calendar.tickers].to_numpy()
-    variances = []
-    for date in feature_dates:
-        sigma_diag = np.array([diag_by_ticker[t].loc[date] for t in calendar.tickers])
-        corr = _correlation_at(cov_by_date, date, ewma_min_periods)
+    def seed_covariance(self, warmup_returns: pd.DataFrame) -> "EwmaVarianceBank":
+        """TRAIN-ONLY burn-in: >= ewma_min_periods bars, no portfolio-variance output yet."""
+        R = warmup_returns[self.tickers].to_numpy(dtype=float)
+        if len(R) < self.ewma_min_periods:
+            raise ValueError(f"Need >= {self.ewma_min_periods} warmup bars, got {len(R)}.")
+        self._current_sigma = np.atleast_2d(np.cov(R[:self.ewma_min_periods], rowvar=False))
+        for i in range(self.ewma_min_periods, len(R)):
+            r_prev = R[i - 1]
+            self._current_sigma = self.ewma_lam * self._current_sigma + (1 - self.ewma_lam) * np.outer(r_prev, r_prev)
+        self._prev_return = R[-1]
+        return self
+
+    def add(self, date, ticker_return_row: pd.Series, sigma_diag_row: pd.Series) -> float:
+        """
+        Own-day rule: date holds the ticker returns realized ON date, and the
+        model's per-ticker variance forecast made FOR date (from date's own
+        preceding feature bar). Returns the resulting portfolio variance.
+        """
+        if self._current_sigma is None:
+            raise ValueError("EwmaVarianceBank: call seed_covariance(...) before add(...).")
+
+        date = pd.Timestamp(date)
+        r_t = ticker_return_row.loc[self.tickers].to_numpy(dtype=float)
+        sigma_diag = sigma_diag_row.loc[self.tickers].to_numpy(dtype=float)
+
+        if self._prev_return is not None:
+            self._current_sigma = self.ewma_lam * self._current_sigma + (1 - self.ewma_lam) * np.outer(
+                self._prev_return, self._prev_return
+            )
+        cov = self._current_sigma.copy()
+        self.cov_by_date[date] = cov
+
+        d_ = np.sqrt(np.diag(cov))
+        d_ = np.where(d_ == 0, np.nan, d_)
+        corr = cov / np.outer(d_, d_)
+        np.fill_diagonal(corr, 1.0)
+
+        sigma_diag = DATA_QUALITY_check_variance_floor(sigma_diag, dates=[date], context="EwmaVarianceBank.add")
         sigma_hat = corr * np.sqrt(np.outer(sigma_diag, sigma_diag))
         np.fill_diagonal(sigma_hat, sigma_diag)
-        variances.append(float(w @ sigma_hat @ w))
+        portfolio_variance = float(DATA_QUALITY_check_variance_floor(
+            float(self.weights @ sigma_hat @ self.weights), dates=[date], context="EwmaVarianceBank.add"
+        )[0])
 
-    variances = DATA_QUALITY_check_variance_floor(
-        np.array(variances), dates=feature_dates, context="predict_portfolio_variance_batch_with_ewma"
-    )
-    return pd.Series(variances, index=feature_dates, name="predicted_variance")
+        self.ticker_returns.loc[date] = ticker_return_row.loc[self.tickers]
+        self.sigma_diag.loc[date] = sigma_diag
+        self.portfolio_variance.loc[date] = portfolio_variance
+        self._prev_return = r_t
+        return portfolio_variance
+
+    def bulk_add(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame) -> pd.Series:
+        """dates MUST be chronologically sorted -- add() is a stateful recursion."""
+        return pd.Series(
+            {date: self.add(date, ticker_returns_df.loc[date], sigma_diag_df.loc[date]) for date in dates},
+            name="predicted_variance",
+        )
+
+    def copy(self) -> "EwmaVarianceBank":
+        new_bank = EwmaVarianceBank(self.tickers, pd.Series(self.weights, index=self.tickers), self.ewma_lam, self.ewma_min_periods)
+        new_bank.ticker_returns = self.ticker_returns.copy()
+        new_bank.sigma_diag = self.sigma_diag.copy()
+        new_bank.portfolio_variance = self.portfolio_variance.copy()
+        new_bank.cov_by_date = dict(self.cov_by_date)
+        new_bank._current_sigma = None if self._current_sigma is None else self._current_sigma.copy()
+        new_bank._prev_return = None if self._prev_return is None else self._prev_return.copy()
+        return new_bank
 
 
 def multi_day_var_from_long_format_model(
     pooled_model: TrainedModel,
     calendar: GroundTruthCalendar,
-    per_ticker_forecast_feature: dict[str, "ForecastFeature"],
-    forecast_dates: pd.DatetimeIndex,
+    long_forecast_feature: "ForecastFeature",
     window_size: int,
     var_confidence: float,
     initial_residual_bank: ResidualBank,
-    ewma_lam: float = 0.94,
-    ewma_min_periods: int = 30,
+    initial_ewma_variance_bank: EwmaVarianceBank,
+    run_key: str | None = None,
 ) -> pd.DataFrame:
     bank = initial_residual_bank.copy()
-    forecast_dates = pd.DatetimeIndex(forecast_dates)
+    ewma_bank = initial_ewma_variance_bank.copy()
+    forecast_dates = calendar.forecast_dates
 
-    if len(forecast_dates) == 0:
+    if len(forecast_dates) < 2:
         return pd.DataFrame(columns=["varForecast", "loss"])
 
-    feature_dates = forecast_dates - calendar.frequency
-    predicted_variances = predict_portfolio_variance_batch_with_ewma(
-        pooled_model, calendar, per_ticker_forecast_feature, feature_dates, ewma_lam, ewma_min_periods
+    # position-based pairing (not calendar.frequency subtraction -- see
+    # multi_day_var_from_pretrained_model for why): forecast_dates[0] itself is
+    # never scored here, since its feature bar is the last TRAINING bar, which
+    # long_forecast_feature doesn't carry.
+    feature_dates = forecast_dates[:-1]
+    outcome_dates = forecast_dates[1:]
+    diag_by_ticker = pooled_model.predict_variance_batch_long(
+        long_forecast_feature.X_forecast_sample, long_forecast_feature.id_cols, feature_dates
     )
-    predicted_variances.index = forecast_dates
+    # own-day rule: the variance forecast made from feature_dates[i] is FOR outcome_dates[i]
+    sigma_diag_df = pd.DataFrame({t: diag_by_ticker[t].to_numpy() for t in calendar.tickers}, index=outcome_dates)
 
-    actual_returns = np.array([calendar.realized_return(d) for d in forecast_dates])
+    predicted_variances = ewma_bank.bulk_add(outcome_dates, calendar.forecast_data[calendar.tickers], sigma_diag_df)
 
-    bank.bulk_insert_respecting_order(forecast_dates, actual_returns, predicted_variances.to_numpy(), window_size)
+    actual_returns = calendar.forecast_data.loc[outcome_dates, "portfolio_return"].to_numpy()
 
-    var_df = bank.multi_day_var(forecast_dates, var_confidence, window_size)
-    var_df["loss"] = [calendar.realized_loss(d) for d in var_df.index]
+    bank.bulk_insert_respecting_order(outcome_dates, actual_returns, predicted_variances.to_numpy(), window_size)
 
-    for date, var_estimate in var_df["varForecast"].items():
-        calendar.add_predicted_var(date, var_estimate)
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, window_size)
+    var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
+
+    calendar.add_predicted_var_batch(run_key or pooled_model.model_name, var_df["varForecast"])
 
     return var_df
 
