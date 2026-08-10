@@ -446,23 +446,46 @@ class ResidualBank:
         self._current_single_stateful_mu = float(window["actual_return"].mean())
         return self
 
+    def _bootstrap_sequential_prefix(self, dates, actual_returns, predicted_variances, window_size: int) -> None:
+        """
+        One bar at a time: step_1 adds the residual using whatever mu_hat has
+        accumulated so far (starting from initial_mu_hat), then step_2 refreshes
+        mu_hat from up to the last window_size bars now available (windowed_read
+        tolerates a partial window). No-look-ahead, but slow -- O(n) individual
+        pandas .loc writes. Only meant for the <= window_size bars bulk_load needs
+        to ramp up mu_hat from scratch; everything after that goes through the
+        vectorized bulk_insert_respecting_order instead.
+        """
+        for date, actual_return, predicted_variance in zip(dates, actual_returns, predicted_variances):
+            self.step_1_add_residual_with_prev_stateful_mu(date, actual_return, predicted_variance)
+            self.step_2_change_stateful_mu(window_size, as_of=date)
+
     def bulk_load(self, dates, actual_returns, predicted_variances, window_size: int) -> "ResidualBank":
         """
-        Seeds a bank from scratch, one bar at a time: step_1 adds the residual using
-        whatever mu_hat has accumulated so far (starting from initial_mu_hat), then
-        step_2 refreshes mu_hat from up to the last window_size bars now available.
-        No-look-ahead throughout, same as step_1/step_2 -- but unlike
-        bulk_insert_respecting_order, it never requires window_size bars of PRIOR
-        history to already exist (windowed_read tolerates a partial window), so this
-        is the one that works on a freshly empty bank. Use bulk_insert_respecting_order
-        instead once the bank already has real history to roll a full window over.
+        Seeds a bank with a batch of historical bars, no-look-ahead throughout.
+        bulk_insert_respecting_order (vectorized, fast) can't compute a rolling
+        mu_hat for a bar without window_size bars of PRIOR history already in the
+        bank, which a from-scratch bank can never have for its own first
+        window_size bars -- so bulk_load only pays the slow sequential
+        bootstrap (_bootstrap_sequential_prefix) for however many MORE bars are
+        needed to reach window_size bars of total history, then hands the
+        (usually much larger) remainder to bulk_insert_respecting_order.
+        Numerically identical to bootstrapping every bar sequentially, just
+        without paying O(n) individual pandas writes for all of it.
         """
         dates = pd.DatetimeIndex(dates, name="Date")
         actual_returns = np.asarray(actual_returns, dtype=float)
         predicted_variances = np.asarray(predicted_variances, dtype=float)
-        for date, actual_return, predicted_variance in zip(dates, actual_returns, predicted_variances):
-            self.step_1_add_residual_with_prev_stateful_mu(date, actual_return, predicted_variance)
-            self.step_2_change_stateful_mu(window_size, as_of=date)
+
+        n_bootstrap = min(max(0, window_size - len(self.residuals)), len(dates))
+        if n_bootstrap:
+            self._bootstrap_sequential_prefix(
+                dates[:n_bootstrap], actual_returns[:n_bootstrap], predicted_variances[:n_bootstrap], window_size
+            )
+        if n_bootstrap < len(dates):
+            self.bulk_insert_respecting_order(
+                dates[n_bootstrap:], actual_returns[n_bootstrap:], predicted_variances[n_bootstrap:], window_size
+            )
         return self
 
     def bulk_insert_respecting_order(self, dates, actual_returns, predicted_variances,
@@ -771,6 +794,17 @@ class EwmaVarianceBank:
         self._prev_return = R[-1]
         return self
 
+    @staticmethod
+    def _portfolio_variance_from_cov(cov: np.ndarray, sigma_diag: np.ndarray, weights: np.ndarray) -> float:
+        """Diagonal = sigma_diag (model forecast), off-diagonal = cov's own correlation. w^T Sigma_hat w."""
+        d_ = np.sqrt(np.diag(cov))
+        d_ = np.where(d_ == 0, np.nan, d_)
+        corr = cov / np.outer(d_, d_)
+        np.fill_diagonal(corr, 1.0)
+        sigma_hat = corr * np.sqrt(np.outer(sigma_diag, sigma_diag))
+        np.fill_diagonal(sigma_hat, sigma_diag)
+        return float(weights @ sigma_hat @ weights)
+
     def add(self, date, ticker_return_row: pd.Series, sigma_diag_row: pd.Series) -> float:
         """
         Own-day rule: date holds the ticker returns realized ON date, and the
@@ -791,16 +825,9 @@ class EwmaVarianceBank:
         cov = self._current_sigma.copy()
         self.cov_by_date[date] = cov
 
-        d_ = np.sqrt(np.diag(cov))
-        d_ = np.where(d_ == 0, np.nan, d_)
-        corr = cov / np.outer(d_, d_)
-        np.fill_diagonal(corr, 1.0)
-
         sigma_diag = DATA_QUALITY_check_variance_floor(sigma_diag, dates=[date], context="EwmaVarianceBank.add")
-        sigma_hat = corr * np.sqrt(np.outer(sigma_diag, sigma_diag))
-        np.fill_diagonal(sigma_hat, sigma_diag)
         portfolio_variance = float(DATA_QUALITY_check_variance_floor(
-            float(self.weights @ sigma_hat @ self.weights), dates=[date], context="EwmaVarianceBank.add"
+            self._portfolio_variance_from_cov(cov, sigma_diag, self.weights), dates=[date], context="EwmaVarianceBank.add"
         )[0])
 
         self.ticker_returns.loc[date] = ticker_return_row.loc[self.tickers]
@@ -810,11 +837,49 @@ class EwmaVarianceBank:
         return portfolio_variance
 
     def bulk_add(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame) -> pd.Series:
-        """dates MUST be chronologically sorted -- add() is a stateful recursion."""
-        return pd.Series(
-            {date: self.add(date, ticker_returns_df.loc[date], sigma_diag_df.loc[date]) for date in dates},
-            name="predicted_variance",
+        """
+        dates MUST be chronologically sorted -- this is a stateful recursion, same
+        math as looping add() one date at a time. Unlike that loop, this runs the
+        recursion over plain numpy arrays and writes ticker_returns/sigma_diag/
+        portfolio_variance/cov_by_date ONCE at the end via pd.concat, instead of
+        one slow pandas .loc assignment per date -- the EWMA update itself can't
+        be vectorized away (each date's covariance genuinely depends on the
+        previous one), but the per-date pandas bookkeeping can be.
+        """
+        if self._current_sigma is None:
+            raise ValueError("EwmaVarianceBank: call seed_covariance(...) before bulk_add(...).")
+
+        dates = pd.DatetimeIndex(dates)
+        R = ticker_returns_df.loc[dates, self.tickers].to_numpy(dtype=float)
+        S = sigma_diag_df.loc[dates, self.tickers].to_numpy(dtype=float)
+        n_dates, n_tickers = len(dates), len(self.tickers)
+
+        sigma = self._current_sigma
+        prev_return = self._prev_return
+        covs = np.empty((n_dates, n_tickers, n_tickers))
+        sigma_diag_out = np.empty((n_dates, n_tickers))
+        portfolio_variances = np.empty(n_dates)
+
+        for i in range(n_dates):
+            if prev_return is not None:
+                sigma = self.ewma_lam * sigma + (1 - self.ewma_lam) * np.outer(prev_return, prev_return)
+            covs[i] = sigma
+            sigma_diag_out[i] = DATA_QUALITY_check_variance_floor(S[i], dates=[dates[i]], context="EwmaVarianceBank.bulk_add")
+            portfolio_variances[i] = self._portfolio_variance_from_cov(sigma, sigma_diag_out[i], self.weights)
+            prev_return = R[i]
+
+        portfolio_variances = DATA_QUALITY_check_variance_floor(portfolio_variances, dates=dates, context="EwmaVarianceBank.bulk_add")
+
+        self.ticker_returns = pd.concat([self.ticker_returns, pd.DataFrame(R, index=dates, columns=self.tickers)])
+        self.sigma_diag = pd.concat([self.sigma_diag, pd.DataFrame(sigma_diag_out, index=dates, columns=self.tickers)])
+        self.portfolio_variance = pd.concat(
+            [self.portfolio_variance, pd.Series(portfolio_variances, index=dates, name="predicted_variance")]
         )
+        self.cov_by_date.update(zip(dates, covs))
+
+        self._current_sigma = sigma
+        self._prev_return = prev_return
+        return pd.Series(portfolio_variances, index=dates, name="predicted_variance")
 
     def copy(self) -> "EwmaVarianceBank":
         new_bank = EwmaVarianceBank(self.tickers, pd.Series(self.weights, index=self.tickers), self.ewma_lam, self.ewma_min_periods)
