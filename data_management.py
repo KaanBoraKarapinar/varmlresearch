@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 import plotly.graph_objects as go
 
 # %%
@@ -15,6 +15,7 @@ from MLProject.var_backtest_utils import run_full_backtest_suite_single_window
 class TrainingFeature(NamedTuple):
     start: pd.Timestamp
     end: pd.Timestamp
+    feature_dates: pd.DatetimeIndex
     target_scale: float
     frequency: pd.Timedelta
     feature_cols: list[str]
@@ -31,15 +32,14 @@ class TrainingFeature(NamedTuple):
 
 
     #only for long format
-    id_cols: pd.DataFrame | None
-
-    # only for long format -- Date/ticker per row of X_out_sample_last_index (parallel to id_cols, which only covers X_in_sample)
-    id_cols_last_index: pd.DataFrame | None
+    X_in_sample_id_cols: pd.DataFrame | None
+    X_out_sample_last_index_id_cols: pd.DataFrame | None
 
 
 class ForecastFeature(NamedTuple):
     start: pd.Timestamp
     end: pd.Timestamp
+    feature_dates: pd.DatetimeIndex
     target_scale: float
     frequency: pd.Timedelta
     feature_cols: list[str]
@@ -102,7 +102,7 @@ class GroundTruthCalendar:
     def __init__(
         self,
         frequency: pd.Timedelta,
-        tickers_data: pd.DataFrame,
+        tickers_raw_price_data: pd.DataFrame,
         tickers: list[str],
         weights: dict[str, float] | pd.Series,
         train_start,
@@ -116,7 +116,7 @@ class GroundTruthCalendar:
         if frequency <= pd.Timedelta(0):
             raise ValueError(f"frequency must be positive: {frequency}")
 
-        missing = set(tickers) - set(tickers_data.columns)
+        missing = set(tickers) - set(tickers_raw_price_data.columns)
         if missing:
             raise ValueError(f"tickers_data is missing columns: {sorted(missing)}")
 
@@ -124,7 +124,9 @@ class GroundTruthCalendar:
         self.tickers = list(tickers)
         self.weights = self._validate_weights(self.tickers, weights)
 
-        full_data = self._compute_portfolio_return_and_loss(tickers_data, self.tickers, self.weights)
+        pct_returns = self._calculate_pct_return(tickers_raw_price_data)
+
+        full_data = self._compute_portfolio_return_and_loss_FOR_PCT_RETURN(pct_returns, self.tickers, self.weights)
 
         self.train_start, self.train_end, self.forecast_start, self.forecast_end = self._validate_windows(
             full_data, train_start, train_end, forecast_start, forecast_end
@@ -154,8 +156,13 @@ class GroundTruthCalendar:
         return weights.loc[tickers] / weights.loc[tickers].sum()
 
     @staticmethod
-    def _compute_portfolio_return_and_loss(tickers_data: pd.DataFrame, tickers: list[str], weights: pd.Series) -> pd.DataFrame:
-        full_data = tickers_data.sort_index().copy()
+    def _calculate_pct_return(tickers_raw_price_data: pd.DataFrame) -> pd.DataFrame:
+        return tickers_raw_price_data.sort_index().pct_change()
+
+
+    @staticmethod
+    def _compute_portfolio_return_and_loss_FOR_PCT_RETURN(tickers_pct_change_data: pd.DataFrame, tickers: list[str], weights: pd.Series) -> pd.DataFrame:
+        full_data = tickers_pct_change_data.sort_index().copy()
         portfolio_return = full_data[tickers].mul(weights, axis="columns").sum(axis=1, min_count=len(tickers))
         full_data["portfolio_return"] = portfolio_return
         full_data["portfolio_loss"] = -portfolio_return
@@ -234,6 +241,66 @@ class GroundTruthCalendar:
         forecast_rows = pd.DataFrame({"split": "forecast"}, index=self.forecast_data.index)
         return pd.concat([train_rows, forecast_rows]).sort_index()
 
+    def next_bars(self, dates) -> pd.DatetimeIndex:
+        """
+        Position-based next bar for each date in `dates`, looked up against the full
+        train+forecast calendar (DANGEROUS_merged_warmedup_FORECAST_data) -- so a date
+        sitting at the train/forecast boundary (e.g. train_end) still resolves to its
+        true next bar in forecast_data. Position-based, not frequency-based, so it
+        correctly skips weekends/holidays instead of naively adding a fixed offset.
+        """
+        index = self.DANGEROUS_merged_warmedup_FORECAST_data.index
+        dates = pd.DatetimeIndex(dates)
+        positions = index.get_indexer(dates)
+        if (positions == -1).any():
+            bad = dates[positions == -1]
+            raise KeyError(f"Dates not found in calendar: {list(bad)}")
+        if (positions + 1 >= len(index)).any():
+            bad = dates[positions + 1 >= len(index)]
+            raise KeyError(f"Dates have no following bar in calendar: {list(bad)}")
+        return index[positions + 1]
+
+    def usable_train_dates(self, candidate_dates, min_periods: int) -> pd.DatetimeIndex:
+        """
+        Intersects `candidate_dates` (e.g. a TrainingFeature's own common_dates --
+        already restricted by that feature's own per-ticker NaN/warmup drops, which the
+        calendar has no visibility into) with train_data dates that have >= min_periods
+        prior train bars available (survived burn-in). Prints the comparison so a caller
+        can see, e.g., that feature warmup already pushed the effective train start later
+        than train_data's own start, or how many candidate dates got cut by burn-in.
+        """
+        candidate_dates = pd.DatetimeIndex(candidate_dates)
+        burned_in = self.train_data.index[min_periods:]
+        usable_dates = candidate_dates[candidate_dates.isin(burned_in)]
+
+        n_candidates = len(candidate_dates)
+        n_usable = len(usable_dates)
+        n_dropped = n_candidates - n_usable
+        burn_in_start = burned_in[0].date() if len(burned_in) else "N/A"
+        print(
+            f"[INFO] usable_train_dates: {n_usable}/{n_candidates} candidate dates survived "
+            f"burn-in (min_periods={min_periods}, train_data starts {self.train_data.index[0].date()}, "
+            f"burn-in cutoff {burn_in_start}, {n_dropped} candidate date(s) dropped)."
+        )
+
+        if usable_dates.empty:
+            raise ValueError(f"usable_train_dates: no candidate dates survived burn-in (min_periods={min_periods}).")
+        return usable_dates
+
+    def forecast_pairs(self) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+        """
+        Usable indices for forecast-phase scoring: feature_dates[i] is the bar
+        immediately before outcome_dates[i], both drawn from forecast_dates by position
+        (not frequency subtraction, for the same skip-weekends/holidays reason as
+        next_bars). forecast_dates[0] is never an outcome here -- its own feature bar is
+        the last TRAINING bar, which no ForecastFeature carries (that boundary case is
+        instead backfilled at training-seed time via next_bars/train_seed_dates).
+        """
+        if len(self.forecast_dates) < 2:
+            empty = self.forecast_dates[:0]
+            return empty, empty
+        return self.forecast_dates[:-1], self.forecast_dates[1:]
+
     #def _lookup(self, date) -> pd.Series:
         #date = pd.Timestamp(date)
         #if date in self.train_data.index:
@@ -285,18 +352,18 @@ class GroundTruthCalendar:
 
 
 class DailyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(hours=24), tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
 
 
 class HourlyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(hours=1), tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
 
 
 class MinuteGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(minutes=1), tickers_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
 
 # %%
 def plot_var_runs(calendar: GroundTruthCalendar, keys: list[str], title: str = "VaR Forecast vs Loss") -> "go.Figure":
@@ -376,20 +443,40 @@ VARIANCE_FLOOR = 1e-12
 
 
 class ResidualBank:
-    def __init__(self, start_timestamp: pd.Timestamp, frequency: pd.Timedelta, initial_mu_hat: float = 0.0):
+    def __init__(
+        self,
+        start_timestamp: pd.Timestamp,
+        frequency: pd.Timedelta,
+        default_mu_hat: float = 0.0,
+        mu_mode: Literal["rolling", "constant"] = "constant",
+        rolling_mu_hat_window_size: int | None = None,
+    ):
         if not isinstance(frequency, pd.Timedelta):
             raise TypeError(f"frequency must be a pd.Timedelta, got: {type(frequency)}")
         if frequency <= pd.Timedelta(0):
             raise ValueError(f"frequency must be positive: {frequency}")
+        if mu_mode not in ("rolling", "constant"):
+            raise ValueError(f"mu_mode must be 'rolling' or 'constant', got: {mu_mode!r}")
+        if mu_mode == "rolling":
+            if rolling_mu_hat_window_size is None or rolling_mu_hat_window_size <= 0:
+                raise ValueError(
+                    f"mu_mode='rolling' requires a positive rolling_mu_hat_window_size, got: {rolling_mu_hat_window_size!r}"
+                )
 
         self.start_timestamp = start_timestamp
         self.frequency = frequency
+        self.default_mu_hat = float(default_mu_hat)
+        self.mu_mode = mu_mode
+        # Fixed at construction, never re-specified per call -- mu_mode="constant" leaves
+        # this None since there's no window to speak of (default_mu_hat is used instead).
+        self.rolling_mu_hat_window_size = rolling_mu_hat_window_size
         self.residuals = pd.DataFrame(columns=RESIDUAL_COLS, index=pd.DatetimeIndex([], name="Date"))
 
         # stateful mu_hat used to standardize the NEXT incoming residual.
         # Deliberately NOT recalculated until step_2, so step_1 never uses information
-        # from the bar it is currently pricing (no look-ahead).
-        self._current_single_stateful_mu = float(initial_mu_hat)
+        # from the bar it is currently pricing (no look-ahead). In mu_mode="constant",
+        # step_2/general_bulk_insert never touch this again -- it stays pinned at default_mu_hat.
+        self._current_single_stateful_mu = float(default_mu_hat)
 
     @property
     def current_mu_hat(self) -> float:
@@ -434,79 +521,104 @@ class ResidualBank:
             mu_hat=self._current_single_stateful_mu,
         )
 
-    def step_2_change_stateful_mu(self, window_size: int, as_of: pd.Timestamp | None = None) -> "ResidualBank":
+    def step_2_change_stateful_mu(self, as_of: pd.Timestamp | None = None) -> "ResidualBank":
         """
         Recompute the stateful mu_hat from the (now updated) windowed history. Call this
         AFTER step_1, once per bar, so the next bar's step_1 sees this bar's return.
+        No-op in mu_mode="constant" -- mu_hat stays pinned at default_mu_hat.
         """
-        window = self.windowed_read(window_size, as_of)
+        if self.mu_mode == "constant":
+            return self
+
+        window = self.windowed_read(self.rolling_mu_hat_window_size, as_of)
         if window.empty:
-            raise ValueError(f"Cannot update mu_hat: residual window is empty (window_size={window_size}, as_of={as_of}).")
+            raise ValueError(
+                f"Cannot update mu_hat: residual window is empty "
+                f"(rolling_mu_hat_window_size={self.rolling_mu_hat_window_size}, as_of={as_of})."
+            )
 
         self._current_single_stateful_mu = float(window["actual_return"].mean())
         return self
 
-    def _bootstrap_sequential_prefix(self, dates, actual_returns, predicted_variances, window_size: int) -> None:
+    def _bootstrap_sequential_prefix(self, dates, actual_returns, predicted_variances) -> None:
         """
         One bar at a time: step_1 adds the residual using whatever mu_hat has
-        accumulated so far (starting from initial_mu_hat), then step_2 refreshes
-        mu_hat from up to the last window_size bars now available (windowed_read
-        tolerates a partial window). No-look-ahead, but slow -- O(n) individual
-        pandas .loc writes. Only meant for the <= window_size bars bulk_load needs
-        to ramp up mu_hat from scratch; everything after that goes through the
-        vectorized bulk_insert_respecting_order instead.
+        accumulated so far (starting from default_mu_hat), then step_2 refreshes
+        mu_hat from up to the last rolling_mu_hat_window_size bars now available
+        (windowed_read tolerates a partial window). No-look-ahead, but slow -- O(n)
+        individual pandas .loc writes. Only meant for the <= rolling_mu_hat_window_size
+        bars training_safe_bulk_insert needs to ramp up mu_hat from scratch; everything
+        after that goes through the vectorized general_bulk_insert instead.
         """
         for date, actual_return, predicted_variance in zip(dates, actual_returns, predicted_variances):
             self.step_1_add_residual_with_prev_stateful_mu(date, actual_return, predicted_variance)
-            self.step_2_change_stateful_mu(window_size, as_of=date)
+            self.step_2_change_stateful_mu(as_of=date)
 
-    def bulk_load(self, dates, actual_returns, predicted_variances, window_size: int) -> "ResidualBank":
+    def training_safe_bulk_insert(self, dates, actual_returns, predicted_variances) -> "ResidualBank":
         """
         Seeds a bank with a batch of historical bars, no-look-ahead throughout.
-        bulk_insert_respecting_order (vectorized, fast) can't compute a rolling
-        mu_hat for a bar without window_size bars of PRIOR history already in the
-        bank, which a from-scratch bank can never have for its own first
-        window_size bars -- so bulk_load only pays the slow sequential
-        bootstrap (_bootstrap_sequential_prefix) for however many MORE bars are
-        needed to reach window_size bars of total history, then hands the
-        (usually much larger) remainder to bulk_insert_respecting_order.
+        general_bulk_insert (vectorized, fast) can't compute a rolling
+        mu_hat for a bar without rolling_mu_hat_window_size bars of PRIOR history
+        already in the bank, which a from-scratch bank can never have for its own
+        first rolling_mu_hat_window_size bars -- so training_safe_bulk_insert only pays
+        the slow sequential bootstrap (_bootstrap_sequential_prefix) for however many
+        MORE bars are needed to reach rolling_mu_hat_window_size bars of total history,
+        then hands the (usually much larger) remainder to general_bulk_insert.
         Numerically identical to bootstrapping every bar sequentially, just
         without paying O(n) individual pandas writes for all of it.
+
+        In mu_mode="constant" there is no rolling-history requirement at all
+        (every row's mu_hat is default_mu_hat), so this skips straight to
+        general_bulk_insert for the whole batch.
+
+        This is purely about mu_hat -- multi_day_var's quantile window is a separate
+        parameter (multi_day_var_calculation_window_size), never touched here.
         """
         dates = pd.DatetimeIndex(dates, name="Date")
         actual_returns = np.asarray(actual_returns, dtype=float)
         predicted_variances = np.asarray(predicted_variances, dtype=float)
 
-        n_bootstrap = min(max(0, window_size - len(self.residuals)), len(dates))
+        if self.mu_mode == "constant":
+            return self.general_bulk_insert(dates, actual_returns, predicted_variances)
+
+        n_bootstrap = min(max(0, self.rolling_mu_hat_window_size - len(self.residuals)), len(dates))
         if n_bootstrap:
             self._bootstrap_sequential_prefix(
-                dates[:n_bootstrap], actual_returns[:n_bootstrap], predicted_variances[:n_bootstrap], window_size
+                dates[:n_bootstrap], actual_returns[:n_bootstrap], predicted_variances[:n_bootstrap]
             )
         if n_bootstrap < len(dates):
-            self.bulk_insert_respecting_order(
-                dates[n_bootstrap:], actual_returns[n_bootstrap:], predicted_variances[n_bootstrap:], window_size
+            self.general_bulk_insert(
+                dates[n_bootstrap:], actual_returns[n_bootstrap:], predicted_variances[n_bootstrap:]
             )
         return self
 
-    def bulk_insert_respecting_order(self, dates, actual_returns, predicted_variances,
-                                     window_size: int) -> "ResidualBank":
+    def general_bulk_insert(self, dates, actual_returns, predicted_variances) -> "ResidualBank":
         """
-        mu_hat_t = mean(actual_return) over the window_size bars STRICTLY BEFORE t
-        (t's own return excluded). Same no-look-ahead rule as step_1/step_2, vectorized.
+        mu_mode="rolling": mu_hat_t = mean(actual_return) over the
+        rolling_mu_hat_window_size bars STRICTLY BEFORE t (t's own return excluded).
+        Same no-look-ahead rule as step_1/step_2, vectorized.
+        mu_mode="constant": mu_hat_t = default_mu_hat for every t -- no history
+        requirement, no rolling/NaN check.
         """
         dates = pd.DatetimeIndex(dates, name="Date")
         actual_returns = np.asarray(actual_returns, dtype=float)
         predicted_variances = DATA_QUALITY_check_variance_floor(predicted_variances, dates=dates,
-                                                                context="bulk_insert_respecting_order")
+                                                                context="general_bulk_insert")
 
-        combined_returns = pd.concat(
-            [self.residuals["actual_return"], pd.Series(actual_returns, index=dates)]).sort_index()
-        combined_returns = combined_returns[~combined_returns.index.duplicated(keep="last")]
+        if self.mu_mode == "constant":
+            mu_hat_new = pd.Series(self.default_mu_hat, index=dates)
+        else:
+            combined_returns = pd.concat(
+                [self.residuals["actual_return"], pd.Series(actual_returns, index=dates)]).sort_index()
+            combined_returns = combined_returns[~combined_returns.index.duplicated(keep="last")]
 
-        mu_hat_new = combined_returns.rolling(window_size).mean().shift(1).loc[dates]
-        if mu_hat_new.isna().any():
-            bad = mu_hat_new[mu_hat_new.isna()].index.tolist()
-            raise ValueError(f"Not enough history for rolling mu_hat (window_size={window_size}) at dates: {bad}")
+            mu_hat_new = combined_returns.rolling(self.rolling_mu_hat_window_size).mean().shift(1).loc[dates]
+            if mu_hat_new.isna().any():
+                bad = mu_hat_new[mu_hat_new.isna()].index.tolist()
+                raise ValueError(
+                    f"Not enough history for rolling mu_hat "
+                    f"(rolling_mu_hat_window_size={self.rolling_mu_hat_window_size}) at dates: {bad}"
+                )
 
         sigma = np.sqrt(predicted_variances)
         standardized_residual = (actual_returns - mu_hat_new.to_numpy()) / sigma
@@ -521,14 +633,18 @@ class ResidualBank:
             },
             index=dates,
         )
-        new_rows = DATA_QUALITY_replace_inf_with_warning(new_rows, context="bulk_insert_respecting_order").dropna()
+        new_rows = DATA_QUALITY_replace_inf_with_warning(new_rows, context="general_bulk_insert").dropna()
 
         self.residuals = pd.concat([self.residuals.drop(index=new_rows.index, errors="ignore"), new_rows]).sort_index()
-        self._current_single_stateful_mu = float(self.residuals["actual_return"].tail(window_size).mean())
+        if self.mu_mode == "constant":
+            self._current_single_stateful_mu = self.default_mu_hat
+        else:
+            self._current_single_stateful_mu = float(self.residuals["actual_return"].tail(self.rolling_mu_hat_window_size).mean())
         return self
 
 
     def windowed_read(self, window_size: int, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
+        """Generic last-N-residuals reader, purpose-agnostic -- callers pass whichever window (rolling_mu_hat_window_size or multi_day_var_calculation_window_size) is relevant to them."""
         df = self.residuals if as_of is None else self.residuals.loc[:as_of]
         return df.tail(window_size)
 
@@ -537,21 +653,29 @@ class ResidualBank:
             target_timestamp: pd.Timestamp,
             predicted_variance: float,
             var_confidence: float,
-            window_size: int,
+            multi_day_var_calculation_window_size: int,
             enforce_window_size: bool = False,
     ) -> pd.Series:
         """
         Compute empirical VaR for a specific target bar. Requires the feature bar
-        (target_timestamp - frequency) to already be present in the residual history,
+        (target_timestamp - frequency) to already be present in the residual history.
 
+        multi_day_var_calculation_window_size and self.rolling_mu_hat_window_size are
+        independent -- the quantile window (VaR tail estimate) and the mu_hat window
+        (drift estimate, only read in mu_mode="rolling") don't have to be the same
+        length, so they're read separately via two windowed_read calls. The mu_hat
+        window is fixed on the bank at construction time (not passed here) since
+        mu_mode/its window is a bank-wide policy, not something that varies per call.
 
-        :param enforce_window_size: if True, raise unless the window contains exactly
-            window_size residuals If False (default), any non-empty window up to window_size is accepted.
+        :param enforce_window_size: if True, raise unless the QUANTILE window contains
+            exactly multi_day_var_calculation_window_size residuals. If False (default),
+            any non-empty window up to that size is accepted. Only gates the quantile
+            window, not the mu_hat window.
         :raises KeyError: if target_timestamp - frequency is not in self.residuals.
-        :raises ValueError: if the window is empty, or (when enforce_window_size=True)
-            shorter than window_size.
+        :raises ValueError: if the quantile window is empty, or (when
+            enforce_window_size=True) shorter than multi_day_var_calculation_window_size.
         :return: pd.Series indexed by target_timestamp, with fields varForecast, mu_hat,
-            predicted_variance, last_feature_timestamp, n_residuals_used.
+            predicted_variance, last_feature_timestamp, n_residuals_used (quantile window size).
         """
         target_timestamp = pd.Timestamp(target_timestamp)
         last_feature_timestamp = target_timestamp - self.frequency
@@ -565,22 +689,37 @@ class ResidualBank:
 
         predicted_variance = float(
             DATA_QUALITY_check_variance_floor(predicted_variance, dates=[target_timestamp], context="empirical_var_for_target")[0])
-        window = self.windowed_read(window_size, as_of=last_feature_timestamp)
+        quantile_window = self.windowed_read(multi_day_var_calculation_window_size, as_of=last_feature_timestamp)
 
-        print(
-            f"[empirical_var_for_target] target={target_timestamp}, using {len(window)} residual(s) up to {last_feature_timestamp}")
-
-        if window.empty:
-            raise ValueError(f"Residual window is empty (window_size={window_size}, as_of={last_feature_timestamp}).")
-
-        if enforce_window_size and len(window) < window_size:
+        if quantile_window.empty:
             raise ValueError(
-                f"enforce_window_size=True but only {len(window)}/{window_size} residuals "
-                f"available as of {last_feature_timestamp} (target={target_timestamp})."
+                f"Residual window is empty (multi_day_var_calculation_window_size={multi_day_var_calculation_window_size}, "
+                f"as_of={last_feature_timestamp})."
             )
 
-        mu_hat = float(window["actual_return"].mean())
-        q = np.quantile(window["standardized_residual"], 1 - var_confidence)
+        if enforce_window_size and len(quantile_window) < multi_day_var_calculation_window_size:
+            raise ValueError(
+                f"enforce_window_size=True but only {len(quantile_window)}/{multi_day_var_calculation_window_size} "
+                f"residuals available as of {last_feature_timestamp} (target={target_timestamp})."
+            )
+
+        if self.mu_mode == "constant":
+            mu_hat = self.default_mu_hat
+        else:
+            mu_window = self.windowed_read(self.rolling_mu_hat_window_size, as_of=last_feature_timestamp)
+            if mu_window.empty:
+                raise ValueError(
+                    f"Cannot compute mu_hat: residual window is empty "
+                    f"(rolling_mu_hat_window_size={self.rolling_mu_hat_window_size}, as_of={last_feature_timestamp})."
+                )
+            mu_hat = float(mu_window["actual_return"].mean())
+
+        print(
+            f"[empirical_var_for_target] target={target_timestamp}, using {len(quantile_window)} residual(s) "
+            f"(quantile window) up to {last_feature_timestamp}"
+        )
+
+        q = np.quantile(quantile_window["standardized_residual"], 1 - var_confidence)
         sigma_hat = np.sqrt(predicted_variance)
         var_estimate = -(mu_hat + sigma_hat * q)
 
@@ -590,16 +729,18 @@ class ResidualBank:
                 "mu_hat": mu_hat,
                 "predicted_variance": predicted_variance,
                 "last_feature_timestamp": last_feature_timestamp,
-                "n_residuals_used": len(window),
+                "n_residuals_used": len(quantile_window),
             },
             name=target_timestamp,
         )
 
-    def multi_day_var(self, dates, var_confidence: float, window_size: int) -> pd.DataFrame:
+    def multi_day_var(self, dates, var_confidence: float, multi_day_var_calculation_window_size: int) -> pd.DataFrame:
         """
         Pure calculation: dates must already be in self.residuals (bulk_insert first).
-        VaR for date t uses standardized_residual from the window_size bars STRICTLY
-        BEFORE t (t excluded).
+        VaR for date t uses standardized_residual from the
+        multi_day_var_calculation_window_size bars STRICTLY BEFORE t (t excluded).
+        mu_hat is read straight off the stored column (written by general_bulk_insert
+        using rolling_mu_hat_window_size at insert time), not recomputed here.
         """
         dates = pd.DatetimeIndex(dates, name="Date")
         missing = dates.difference(self.residuals.index)
@@ -608,7 +749,7 @@ class ResidualBank:
 
         q_series = (
             self.residuals["standardized_residual"]
-            .rolling(window_size)
+            .rolling(multi_day_var_calculation_window_size)
             .apply(lambda w: np.quantile(w, 1 - var_confidence), raw=True)
             .shift(1)
         )
@@ -619,16 +760,25 @@ class ResidualBank:
         if result["quantile"].isna().any():
             bad = result.index[result["quantile"].isna()].tolist()
             raise ValueError(
-                f"Not enough prior residual history for quantile (window_size={window_size}) at dates: {bad}")
+                f"Not enough prior residual history for quantile "
+                f"(multi_day_var_calculation_window_size={multi_day_var_calculation_window_size}) at dates: {bad}"
+            )
 
         result["varForecast"] = -(result["mu_hat"] + result["predicted_sigma"] * result["quantile"])
         return result[["varForecast"]]
 
 
     def copy(self) -> "ResidualBank":
-        new_bank = ResidualBank(self.start_timestamp, self.frequency, self._current_single_stateful_mu)
+        new_bank = ResidualBank(
+            self.start_timestamp, self.frequency, self.default_mu_hat, self.mu_mode, self.rolling_mu_hat_window_size
+        )
         new_bank.residuals = self.residuals.copy()
+        new_bank._current_single_stateful_mu = self._current_single_stateful_mu
         return new_bank
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return self.residuals
+
 
 
 # %%
@@ -673,8 +823,7 @@ class TrainedModel(ABC):
         """
         Splits a long-format (one row per (Date, ticker)) feature block into one
         date-indexed wide view per ticker via id_cols, and scores each with
-        predict_variance_batch_wide. Concrete on the base class -- every
-        subclass gets this for free by implementing predict_variance_batch_wide.
+        predict_variance_batch_wide.
         """
         feature_dates = pd.DatetimeIndex(feature_dates)
         result: dict[str, pd.Series] = {}
@@ -683,7 +832,7 @@ class TrainedModel(ABC):
                 id_cols.loc[rows, "Date"].to_numpy(), axis=0
             ).sort_index()
             ticker_view = ForecastFeature(
-                start=self.training_feature.start, end=self.training_feature.end,
+                start=ticker_X.index.min(), end=ticker_X.index.max(), feature_dates=ticker_X.index,
                 target_scale=self.target_scale, frequency=self.training_feature.frequency,
                 feature_cols=self.feature_cols, type="wide",
                 X_forecast_sample=ticker_X, y_forecast_sample=pd.DataFrame(),
@@ -710,7 +859,7 @@ def multi_day_var_from_pretrained_model(
     trained_model: TrainedModel,
     forecast_feature: "ForecastFeature",
     calendar: GroundTruthCalendar,
-    window_size: int,
+    multi_day_var_calculation_window_size: int,
     var_confidence: float,
     run_key: str | None = None,
 ) -> pd.DataFrame:
@@ -720,29 +869,29 @@ def multi_day_var_from_pretrained_model(
     index IS calendar.forecast_dates by construction, so actual returns/losses
     are read straight off it -- no train_data ever touched here.
 
-    feature_dates/outcome_dates are paired by POSITION (forecast_dates[i-1] is
-    the feature bar for forecast_dates[i]), not by subtracting calendar.frequency
-    -- a calendar-day subtraction lands on a non-trading day (weekend, or any
-    holiday skipped inside the forecast window) and would KeyError. This also
-    means forecast_dates[0] itself is never scored here: its feature bar is the
-    last TRAINING bar, which forecast_feature doesn't carry.
+    feature_dates/outcome_dates come from calendar.forecast_pairs() -- see that
+    method for why forecast_dates[0] itself is never scored here.
+
+    trained_model.residual_bank_in_sample already carries its rolling_mu_hat_window_size
+    (fixed at construction, see ResidualBank.__init__) so general_bulk_insert reads it off
+    the bank instead of taking it here. multi_day_var_calculation_window_size feeds the
+    VaR quantile rolling window (multi_day_var) -- that one's independent and still passed
+    per call.
     """
     bank = trained_model.residual_bank_in_sample.copy()
-    forecast_dates = calendar.forecast_dates
+    feature_dates, outcome_dates = calendar.forecast_pairs()
 
-    if len(forecast_dates) < 2:
+    if len(outcome_dates) == 0:
         return pd.DataFrame(columns=["varForecast", "loss"])
 
-    feature_dates = forecast_dates[:-1]
-    outcome_dates = forecast_dates[1:]
     predicted_variances = trained_model.predict_variance_batch_wide(forecast_feature, feature_dates)
     predicted_variances.index = outcome_dates
 
     actual_returns = calendar.forecast_data.loc[outcome_dates, "portfolio_return"].to_numpy()
 
-    bank.bulk_insert_respecting_order(outcome_dates, actual_returns, predicted_variances.to_numpy(), window_size)
+    bank.general_bulk_insert(outcome_dates, actual_returns, predicted_variances.to_numpy())
 
-    var_df = bank.multi_day_var(outcome_dates, var_confidence, window_size)
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size)
     var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
 
     calendar.add_predicted_var_batch(run_key or trained_model.model_name, var_df["varForecast"])
@@ -758,9 +907,9 @@ class EwmaVarianceBank:
     RiskMetrics-style EWMA on raw ticker returns. Portfolio variance is the
     full quadratic form w^T Sigma_hat w.
 
-    Mirrors ResidualBank's lifecycle exactly: seed_covariance()+add() during
+    Mirrors ResidualBank's lifecycle exactly: training_safe_bulk_insert()+add() during
     training builds the *_in_sample bank, then .copy() carries it into the
-    forecast phase where add()/bulk_add() keep extending it one date at a time.
+    forecast phase where add()/general_bulk_insert() keep extending it one date at a time.
 
     No-look-ahead by construction: add(date, ...) rolls the EWMA covariance
     forward using the PREVIOUS call's return (self._prev_return), never the
@@ -782,8 +931,20 @@ class EwmaVarianceBank:
         self._current_sigma: np.ndarray | None = None
         self._prev_return: np.ndarray | None = None
 
-    def seed_covariance(self, warmup_returns: pd.DataFrame) -> "EwmaVarianceBank":
-        """TRAIN-ONLY burn-in: >= ewma_min_periods bars, no portfolio-variance output yet."""
+    def training_safe_bulk_insert(self, warmup_returns: pd.DataFrame) -> "EwmaVarianceBank":
+        """
+        TRAIN-ONLY burn-in: >= ewma_min_periods bars, no portfolio-variance output yet.
+
+        The seed covariance (plain sample cov over the first ewma_min_periods bars)
+        already encodes every one of those bars, INCLUDING the seed window's own last
+        bar -- so when exactly ewma_min_periods bars are given, _prev_return is left
+        None rather than that last bar's return. Setting it would make the very next
+        add()/general_bulk_insert() call blend that same bar's outer product back into
+        the seed cov a second time. Only bars processed AFTER the seed loop
+        (len(R) > ewma_min_periods) leave a genuine "pending" return to chain forward,
+        since those were walked one at a time via the recursion, not folded into the
+        batch np.cov.
+        """
         R = warmup_returns[self.tickers].to_numpy(dtype=float)
         if len(R) < self.ewma_min_periods:
             raise ValueError(f"Need >= {self.ewma_min_periods} warmup bars, got {len(R)}.")
@@ -791,7 +952,7 @@ class EwmaVarianceBank:
         for i in range(self.ewma_min_periods, len(R)):
             r_prev = R[i - 1]
             self._current_sigma = self.ewma_lam * self._current_sigma + (1 - self.ewma_lam) * np.outer(r_prev, r_prev)
-        self._prev_return = R[-1]
+        self._prev_return = R[-1] if len(R) > self.ewma_min_periods else None
         return self
 
     @staticmethod
@@ -812,7 +973,7 @@ class EwmaVarianceBank:
         preceding feature bar). Returns the resulting portfolio variance.
         """
         if self._current_sigma is None:
-            raise ValueError("EwmaVarianceBank: call seed_covariance(...) before add(...).")
+            raise ValueError("EwmaVarianceBank: call training_safe_bulk_insert(...) before add(...).")
 
         date = pd.Timestamp(date)
         r_t = ticker_return_row.loc[self.tickers].to_numpy(dtype=float)
@@ -836,7 +997,7 @@ class EwmaVarianceBank:
         self._prev_return = r_t
         return portfolio_variance
 
-    def bulk_add(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame) -> pd.Series:
+    def general_bulk_insert(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame) -> pd.Series:
         """
         dates MUST be chronologically sorted -- this is a stateful recursion, same
         math as looping add() one date at a time. Unlike that loop, this runs the
@@ -847,7 +1008,7 @@ class EwmaVarianceBank:
         previous one), but the per-date pandas bookkeeping can be.
         """
         if self._current_sigma is None:
-            raise ValueError("EwmaVarianceBank: call seed_covariance(...) before bulk_add(...).")
+            raise ValueError("EwmaVarianceBank: call training_safe_bulk_insert(...) before general_bulk_insert(...).")
 
         dates = pd.DatetimeIndex(dates)
         R = ticker_returns_df.loc[dates, self.tickers].to_numpy(dtype=float)
@@ -864,11 +1025,11 @@ class EwmaVarianceBank:
             if prev_return is not None:
                 sigma = self.ewma_lam * sigma + (1 - self.ewma_lam) * np.outer(prev_return, prev_return)
             covs[i] = sigma
-            sigma_diag_out[i] = DATA_QUALITY_check_variance_floor(S[i], dates=[dates[i]], context="EwmaVarianceBank.bulk_add")
+            sigma_diag_out[i] = DATA_QUALITY_check_variance_floor(S[i], dates=[dates[i]], context="EwmaVarianceBank.general_bulk_insert")
             portfolio_variances[i] = self._portfolio_variance_from_cov(sigma, sigma_diag_out[i], self.weights)
             prev_return = R[i]
 
-        portfolio_variances = DATA_QUALITY_check_variance_floor(portfolio_variances, dates=dates, context="EwmaVarianceBank.bulk_add")
+        portfolio_variances = DATA_QUALITY_check_variance_floor(portfolio_variances, dates=dates, context="EwmaVarianceBank.general_bulk_insert")
 
         self.ticker_returns = pd.concat([self.ticker_returns, pd.DataFrame(R, index=dates, columns=self.tickers)])
         self.sigma_diag = pd.concat([self.sigma_diag, pd.DataFrame(sigma_diag_out, index=dates, columns=self.tickers)])
@@ -891,46 +1052,61 @@ class EwmaVarianceBank:
         new_bank._prev_return = None if self._prev_return is None else self._prev_return.copy()
         return new_bank
 
+    def to_dataframe(self) -> pd.DataFrame:
+        """
+        Combines ticker_returns, sigma_diag, and portfolio_variance into a single
+        wide-format DataFrame. Columns are multi-indexed: (returns, TICKER),
+        (sigma_diag, TICKER), (portfolio_variance, ''). cov_by_date is deliberately
+        excluded -- pull that separately if needed.
+        """
+        return pd.concat(
+            {
+                "returns": self.ticker_returns,
+                "sigma_diag": self.sigma_diag,
+                "portfolio_variance": self.portfolio_variance.to_frame("portfolio_variance"),
+            },
+            axis=1,
+        )
+
 
 def multi_day_var_from_long_format_model(
     pooled_model: TrainedModel,
     calendar: GroundTruthCalendar,
     long_forecast_feature: "ForecastFeature",
-    window_size: int,
+    multi_day_var_calculation_window_size: int,
     var_confidence: float,
     initial_residual_bank: ResidualBank,
     initial_ewma_variance_bank: EwmaVarianceBank,
     run_key: str | None = None,
 ) -> pd.DataFrame:
+    # initial_residual_bank already carries its rolling_mu_hat_window_size (fixed at
+    # construction, see ResidualBank.__init__) -- general_bulk_insert below reads it off
+    # the bank, not passed here.
     bank = initial_residual_bank.copy()
     ewma_bank = initial_ewma_variance_bank.copy()
-    forecast_dates = calendar.forecast_dates
 
-    if len(forecast_dates) < 2:
+    # see calendar.forecast_pairs() for why forecast_dates[0] itself is never scored here.
+    feature_dates, outcome_dates = calendar.forecast_pairs()
+
+    if len(outcome_dates) == 0:
         return pd.DataFrame(columns=["varForecast", "loss"])
 
-    # position-based pairing (not calendar.frequency subtraction -- see
-    # multi_day_var_from_pretrained_model for why): forecast_dates[0] itself is
-    # never scored here, since its feature bar is the last TRAINING bar, which
-    # long_forecast_feature doesn't carry.
-    feature_dates = forecast_dates[:-1]
-    outcome_dates = forecast_dates[1:]
     diag_by_ticker = pooled_model.predict_variance_batch_long(
         long_forecast_feature.X_forecast_sample, long_forecast_feature.id_cols, feature_dates
     )
     # own-day rule: the variance forecast made from feature_dates[i] is FOR outcome_dates[i]
     sigma_diag_df = pd.DataFrame({t: diag_by_ticker[t].to_numpy() for t in calendar.tickers}, index=outcome_dates)
 
-    predicted_variances = ewma_bank.bulk_add(outcome_dates, calendar.forecast_data[calendar.tickers], sigma_diag_df)
+    predicted_variances = ewma_bank.general_bulk_insert(outcome_dates, calendar.forecast_data[calendar.tickers], sigma_diag_df)
 
     actual_returns = calendar.forecast_data.loc[outcome_dates, "portfolio_return"].to_numpy()
 
-    bank.bulk_insert_respecting_order(outcome_dates, actual_returns, predicted_variances.to_numpy(), window_size)
+    bank.general_bulk_insert(outcome_dates, actual_returns, predicted_variances.to_numpy())
 
-    var_df = bank.multi_day_var(outcome_dates, var_confidence, window_size)
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size)
     var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
 
     calendar.add_predicted_var_batch(run_key or pooled_model.model_name, var_df["varForecast"])
 
-    return var_df
+    return var_df, bank, ewma_bank
 

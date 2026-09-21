@@ -78,18 +78,27 @@ def build_wide_features(
     r_next_forecast = merged_returns["portfolio_return"].shift(-1)
 
     training_feature = TrainingFeature(
-        start=calendar.train_start, end=calendar.train_end,
+        # train_clean.index can start later than calendar.train_start -- rolling-window
+        # warmup (e.g. a 21-bar std) has no history before train_start to draw from, so
+        # dropna(subset=feature_cols) in _build_common already cuts those bars. Deriving
+        # start/end/feature_dates from the actual surviving index (instead of trusting
+        # calendar.train_start/train_end) keeps them truthful about what X_in_sample covers.
+        start=train_clean.index.min(), end=train_clean.index.max(), feature_dates=train_clean.index,
         feature_cols=feature_cols,
         target_scale=target_scale, frequency=calendar.frequency, type="wide",
         X_in_sample=train_clean[feature_cols],
         X_out_sample_last_index=train_last[feature_cols],
         y_in_sample=train_clean[["target"]] * target_scale,
         DANGEROUS_r_next_in_sample=r_next_train.loc[train_clean.index],
-        id_cols=None,
-        id_cols_last_index=None,
+        X_in_sample_id_cols=None,
+        X_out_sample_last_index_id_cols=None,
     )
     forecast_feature = ForecastFeature(
-        start=calendar.forecast_start, end=calendar.forecast_end,
+        # forecast_df is built off DANGEROUS_merged_warmedup_FORECAST_data, so unlike the
+        # train side it has train-period history to draw rolling windows from and should
+        # already span exactly calendar.forecast_data.index -- still derived from the
+        # actual index rather than assumed, for the same reason as training_feature above.
+        start=forecast_df.index.min(), end=forecast_df.index.max(), feature_dates=forecast_df.index,
         feature_cols=feature_cols,
         target_scale=target_scale, frequency=calendar.frequency, type="wide",
         X_forecast_sample=forecast_df[feature_cols],
@@ -176,19 +185,26 @@ def build_long_features(
         raise ValueError(
             f"No usable (target-known) long-format rows in train window [{calendar.train_start} .. {calendar.train_end}].")
 
+    # feature_dates: distinct dates X_in_sample/X_forecast_sample actually cover (one row
+    # per (Date, ticker) in long format, so this collapses back to one entry per date).
+    # Same burn-in-honesty reasoning as build_wide_features -- train_clean's dates can
+    # start later than calendar.train_start because of rolling-window warmup.
+    train_feature_dates = pd.DatetimeIndex(train_clean["Date"].unique()).sort_values()
+    forecast_feature_dates = pd.DatetimeIndex(forecast_full["Date"].unique()).sort_values()
+
     training_feature = TrainingFeature(
-        start=calendar.train_start, end=calendar.train_end,
+        start=train_feature_dates.min(), end=train_feature_dates.max(), feature_dates=train_feature_dates,
         feature_cols=feature_cols,
         target_scale=target_scale, frequency=calendar.frequency, type="long",
         X_in_sample=train_clean[feature_cols],
         X_out_sample_last_index=train_last[feature_cols],
         y_in_sample=train_clean[["target"]].assign(target=train_clean["target"] * target_scale),
         DANGEROUS_r_next_in_sample=train_clean["r_next"],
-        id_cols=train_clean[id_cols_list],
-        id_cols_last_index=train_last[id_cols_list],
+        X_in_sample_id_cols=train_clean[id_cols_list],
+        X_out_sample_last_index_id_cols=train_last[id_cols_list],
     )
     forecast_feature = ForecastFeature(
-        start=calendar.forecast_start, end=calendar.forecast_end,
+        start=forecast_feature_dates.min(), end=forecast_feature_dates.max(), feature_dates=forecast_feature_dates,
         feature_cols=feature_cols,
         target_scale=target_scale, frequency=calendar.frequency, type="long",
         X_forecast_sample=forecast_full[feature_cols],
