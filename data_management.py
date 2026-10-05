@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 
 
 
-from MLProject.var_backtest_utils import run_full_backtest_suite_single_window
+from var_backtest_utils import run_full_backtest_suite_single_window
 
 
 # %%
@@ -439,6 +439,7 @@ import pandas as pd
 
 RESIDUAL_COLS = ["actual_return", "predicted_variance", "predicted_sigma", "mu_hat", "standardized_residual"]
 VARIANCE_FLOOR = 1e-12
+DEFAULT_EXPANDING_MIN_PERIODS = 30
 
 
 
@@ -734,25 +735,46 @@ class ResidualBank:
             name=target_timestamp,
         )
 
-    def multi_day_var(self, dates, var_confidence: float, multi_day_var_calculation_window_size: int) -> pd.DataFrame:
+    def multi_day_var(
+            self,
+            dates,
+            var_confidence: float,
+            multi_day_var_calculation_window_size: int | None,
+            min_periods: int | None = None,
+    ) -> pd.DataFrame:
         """
         Pure calculation: dates must already be in self.residuals (bulk_insert first).
-        VaR for date t uses standardized_residual from the
-        multi_day_var_calculation_window_size bars STRICTLY BEFORE t (t excluded).
-        mu_hat is read straight off the stored column (written by general_bulk_insert
-        using rolling_mu_hat_window_size at insert time), not recomputed here.
+        VaR for date t uses standardized_residual from the bars STRICTLY BEFORE t
+        (t excluded). mu_hat is read straight off the stored column (written by
+        general_bulk_insert using rolling_mu_hat_window_size at insert time), not
+        recomputed here.
+
+        multi_day_var_calculation_window_size:
+            int  -> rolling window: the last N residuals before t.
+            None -> expanding window: ALL residuals before t (use every bar available).
+        min_periods: fewest prior residuals a date needs to get a VaR (fewer -> ValueError).
+            Defaults to N for the rolling window (i.e. the window must be full) and to
+            DEFAULT_EXPANDING_MIN_PERIODS for the expanding window (a quantile over a
+            handful of residuals is meaningless).
+
+        :return: DataFrame indexed by dates with varForecast and n_residuals_used (how
+            many residuals the quantile of that date was computed from).
         """
         dates = pd.DatetimeIndex(dates, name="Date")
         missing = dates.difference(self.residuals.index)
         if len(missing):
             raise KeyError(f"multi_day_var: dates missing from residual history: {list(missing)}")
 
-        q_series = (
-            self.residuals["standardized_residual"]
-            .rolling(multi_day_var_calculation_window_size)
-            .apply(lambda w: np.quantile(w, 1 - var_confidence), raw=True)
-            .shift(1)
+        expanding = multi_day_var_calculation_window_size is None
+        if min_periods is None:
+            min_periods = DEFAULT_EXPANDING_MIN_PERIODS if expanding else multi_day_var_calculation_window_size
+
+        standardized = self.residuals["standardized_residual"]
+        roller = (
+            standardized.expanding(min_periods=min_periods) if expanding
+            else standardized.rolling(multi_day_var_calculation_window_size, min_periods=min_periods)
         )
+        q_series = roller.apply(lambda w: np.quantile(w, 1 - var_confidence), raw=True).shift(1)
 
         result = self.residuals.loc[dates, ["mu_hat", "predicted_sigma"]].copy()
         result["quantile"] = q_series.loc[dates]
@@ -761,11 +783,16 @@ class ResidualBank:
             bad = result.index[result["quantile"].isna()].tolist()
             raise ValueError(
                 f"Not enough prior residual history for quantile "
-                f"(multi_day_var_calculation_window_size={multi_day_var_calculation_window_size}) at dates: {bad}"
+                f"(multi_day_var_calculation_window_size={multi_day_var_calculation_window_size}, "
+                f"min_periods={min_periods}) at dates: {bad}"
             )
 
         result["varForecast"] = -(result["mu_hat"] + result["predicted_sigma"] * result["quantile"])
-        return result[["varForecast"]]
+
+        # residuals strictly before each date == its row position (index is sorted and unique)
+        n_prior = self.residuals.index.get_indexer(dates)
+        result["n_residuals_used"] = n_prior if expanding else np.minimum(n_prior, multi_day_var_calculation_window_size)
+        return result[["varForecast", "n_residuals_used"]]
 
 
     def copy(self) -> "ResidualBank":
@@ -859,9 +886,10 @@ def multi_day_var_from_pretrained_model(
     trained_model: TrainedModel,
     forecast_feature: "ForecastFeature",
     calendar: GroundTruthCalendar,
-    multi_day_var_calculation_window_size: int,
+    multi_day_var_calculation_window_size: int | None,
     var_confidence: float,
     run_key: str | None = None,
+    multi_day_var_min_periods: int | None = None,
 ) -> pd.DataFrame:
     """
     forecast_dates is no longer a parameter, calendar.forecast_dates is the
@@ -891,7 +919,7 @@ def multi_day_var_from_pretrained_model(
 
     bank.general_bulk_insert(outcome_dates, actual_returns, predicted_variances.to_numpy())
 
-    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size)
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size, multi_day_var_min_periods)
     var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
 
     calendar.add_predicted_var_batch(run_key or trained_model.model_name, var_df["varForecast"])
@@ -1073,11 +1101,12 @@ def multi_day_var_from_long_format_model(
     pooled_model: TrainedModel,
     calendar: GroundTruthCalendar,
     long_forecast_feature: "ForecastFeature",
-    multi_day_var_calculation_window_size: int,
+    multi_day_var_calculation_window_size: int | None,
     var_confidence: float,
     initial_residual_bank: ResidualBank,
     initial_ewma_variance_bank: EwmaVarianceBank,
     run_key: str | None = None,
+    multi_day_var_min_periods: int | None = None,
 ) -> pd.DataFrame:
     # initial_residual_bank already carries its rolling_mu_hat_window_size (fixed at
     # construction, see ResidualBank.__init__) -- general_bulk_insert below reads it off
@@ -1103,7 +1132,7 @@ def multi_day_var_from_long_format_model(
 
     bank.general_bulk_insert(outcome_dates, actual_returns, predicted_variances.to_numpy())
 
-    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size)
+    var_df = bank.multi_day_var(outcome_dates, var_confidence, multi_day_var_calculation_window_size, multi_day_var_min_periods)
     var_df["loss"] = calendar.forecast_data.loc[var_df.index, "portfolio_loss"]
 
     calendar.add_predicted_var_batch(run_key or pooled_model.model_name, var_df["varForecast"])
