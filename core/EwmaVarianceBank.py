@@ -142,7 +142,7 @@ class EwmaVarianceBank:
         self._prev_return = r_t
         return portfolio_variance
 
-    def general_bulk_insert(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame) -> pd.Series:
+    def general_bulk_insert(self, dates, ticker_returns_df: pd.DataFrame, sigma_diag_df: pd.DataFrame | None = None) -> pd.Series:
         """
         dates must be chronologically sorted and come after the bank's last date (checked, see
         _check_dates_follow_history) -- this is a stateful recursion, same
@@ -159,7 +159,7 @@ class EwmaVarianceBank:
         dates = pd.DatetimeIndex(dates)
         self._check_dates_follow_history(dates)
         R = ticker_returns_df.loc[dates, self.tickers].to_numpy(dtype=float)
-        S = sigma_diag_df.loc[dates, self.tickers].to_numpy(dtype=float)
+        S = None if sigma_diag_df is None else sigma_diag_df.loc[dates, self.tickers].to_numpy(dtype=float)
         n_dates, n_tickers = len(dates), len(self.tickers)
 
         sigma = self._current_sigma
@@ -172,8 +172,15 @@ class EwmaVarianceBank:
             if prev_return is not None:
                 sigma = self.ewma_lam * sigma + (1 - self.ewma_lam) * np.outer(prev_return, prev_return)
             covs[i] = sigma
-            sigma_diag_out[i] = DATA_QUALITY_check_variance_floor(S[i], dates=[dates[i]], context="EwmaVarianceBank.general_bulk_insert")
-            portfolio_variances[i] = self._portfolio_variance_from_cov(sigma, sigma_diag_out[i], self.weights)
+            # sigma_diag_df=None: no model forecast is mixed in, the covariance's OWN diagonal is used, so the
+            # portfolio variance is the pure EWMA w^T Sigma w of the realized returns
+            # (what GroundTruthCalendar.ewma_realized_variance_bank does).
+            if S is None:
+                sigma_diag_out[i] = np.diag(sigma)
+                portfolio_variances[i] = self.weights @ sigma @ self.weights
+            else:
+                sigma_diag_out[i] = DATA_QUALITY_check_variance_floor(S[i], dates=[dates[i]], context="EwmaVarianceBank.general_bulk_insert")
+                portfolio_variances[i] = self._portfolio_variance_from_cov(sigma, sigma_diag_out[i], self.weights)
             prev_return = R[i]
 
         portfolio_variances = DATA_QUALITY_check_variance_floor(portfolio_variances, dates=dates, context="EwmaVarianceBank.general_bulk_insert")

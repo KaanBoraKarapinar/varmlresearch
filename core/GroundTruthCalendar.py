@@ -6,6 +6,8 @@ import plotly.graph_objects as go
 
 from var_backtest_utils import run_full_backtest_suite_single_window
 
+from .EwmaVarianceBank import EwmaVarianceBank
+
 if TYPE_CHECKING:
     from .ResidualBank import ResidualBank
 
@@ -280,6 +282,49 @@ class GroundTruthCalendar:
             raise ValueError(f"train_dates_past_burn_in: no candidate dates are past the burn-in (burn_in_bars={burn_in_bars}).")
         return kept_dates
 
+    def ewma_realized_variance_bank(self, ewma_lam: float = 0.94, ewma_min_periods: int = 30) -> EwmaVarianceBank:
+        """
+        A plain EwmaVarianceBank filled with the REALIZED returns only (no model forecast mixed in), as the
+        realized-variance reference for the model outputs: bank.portfolio_variance is the pure EWMA
+        w^T Sigma w, bank.cov_by_date the matrices (plot_ewma_bank works on it).
+
+        Warmed up and walked the same way training walks the model's bank: the seed is the `ewma_min_periods`
+        bars ending at seed_end = max(warmup_bars, ewma_min_periods - 1) on warmup + train, then every later
+        bar of train + forecast is inserted. So the dates are the model banks' outcome dates, and each
+        date's variance is built from strictly earlier returns (the same information the model had).
+
+        It reads forecast-period returns: an EVALUATION/plot reference only, never a model input.
+        """
+        returns = self.DANGEROUS_merged_warmedup_FORECAST_data[self.tickers]
+        seed_end = max(len(self.warmup_data), ewma_min_periods - 1)
+        if seed_end + 1 >= len(returns):
+            raise ValueError(f"ewma_realized_variance_bank: need more than {seed_end + 1} bars (warmup + train + forecast), got {len(returns)}.")
+
+        bank = EwmaVarianceBank(self, ewma_lam=ewma_lam, ewma_min_periods=ewma_min_periods)
+        bank.start_training(self).training_safe_bulk_insert(returns.iloc[seed_end - ewma_min_periods + 1: seed_end + 1])
+        bank.general_bulk_insert(returns.index[seed_end + 1:], returns)
+        return bank
+
+    def ewma_realized_variance(self, ewma_lam: float = 0.94, ewma_min_periods: int = 30) -> pd.Series:
+        """
+        The REALIZED EWMA variance of every bar: v_d already contains r_d (the return realized ON d), unlike
+        ewma_realized_variance_bank, whose value at d is built from the returns BEFORE d.
+
+        So v_d is the bank's value of the next bar (v_d = w^T Sigma_(d+1) w, Sigma_(d+1) = lam * Sigma_d +
+        (1 - lam) * r_d r_d^T); the very last bar has no next bar in the bank, so its step is taken here.
+        The first value (the seed bar) is the seed covariance itself, which already contains that bar.
+        Indexed seed bar .. last forecast bar. EVALUATION/plot reference only, it reads forecast-period returns.
+        """
+        bank = self.ewma_realized_variance_bank(ewma_lam, ewma_min_periods)
+        last_date = bank.portfolio_variance.index[-1]
+        r_last = bank.ticker_returns.loc[last_date].to_numpy(dtype=float)
+        cov_with_last = ewma_lam * bank.cov_by_date[last_date].to_numpy() + (1 - ewma_lam) * np.outer(r_last, r_last)
+        last_variance = float(bank.weights @ cov_with_last @ bank.weights)
+
+        seed_end = max(len(self.warmup_data), ewma_min_periods - 1)
+        index = self.DANGEROUS_merged_warmedup_FORECAST_data.index[seed_end:]
+        return pd.Series(np.append(bank.portfolio_variance.to_numpy(), last_variance), index=index, name="ewma_realized_variance")
+
     #def _lookup(self, date) -> pd.Series:
         #date = pd.Timestamp(date)
         #if date in self.train_data.index:
@@ -311,7 +356,7 @@ class GroundTruthCalendar:
         self._get_or_create_run(key).set_batch(var_series)
         return self
 
-    def var_from_residual_bank(
+    def var_from_residual_bank_forecast_period(
         self,
         bank: "ResidualBank",
         var_confidence: float,
@@ -331,6 +376,46 @@ class GroundTruthCalendar:
         )
         var_df["loss"] = self.forecast_data.loc[var_df.index, "portfolio_loss"]
         self.add_predicted_var_batch(run_key, var_df["varForecast"])
+        return var_df
+
+    def var_from_residual_bank_train_period(
+        self,
+        bank: "ResidualBank",
+        var_confidence: float,
+        multi_day_var_calculation_window_size: int | None,
+        multi_day_var_min_periods: int,
+    ) -> pd.DataFrame:
+        """
+        The VaR of the TRAIN dates the bank holds (in-sample), with the realized loss. The first
+        multi_day_var_min_periods bank dates are dropped: they do not have that many prior residuals yet
+        (multi_day_var would raise). Not recorded as a run: var_prediction_runs / backtest are forecast-only.
+        """
+        train_dates = bank.residuals.index[bank.residuals.index.isin(self.train_data.index)]
+        var_df = bank.multi_day_var(
+            train_dates[multi_day_var_min_periods:], var_confidence,
+            multi_day_var_calculation_window_size, multi_day_var_min_periods,
+        )
+        var_df["loss"] = self.train_data.loc[var_df.index, "portfolio_loss"]
+        return var_df
+
+    def var_from_residual_bank_entire_period(
+        self,
+        bank: "ResidualBank",
+        var_confidence: float,
+        multi_day_var_calculation_window_size: int | None,
+        multi_day_var_min_periods: int,
+    ) -> pd.DataFrame:
+        """
+        The VaR of every train + forecast date the bank holds, with the realized loss. Same as
+        var_from_residual_bank_train_period: the first multi_day_var_min_periods bank dates are dropped and
+        no run is recorded.
+        """
+        entire_dates = bank.residuals.index[bank.residuals.index.isin(self.train_data.index.append(self.forecast_dates))]
+        var_df = bank.multi_day_var(
+            entire_dates[multi_day_var_min_periods:], var_confidence,
+            multi_day_var_calculation_window_size, multi_day_var_min_periods,
+        )
+        var_df["loss"] = self.DANGEROUS_merged_warmedup_FORECAST_data.loc[var_df.index, "portfolio_loss"]
         return var_df
 
     def backtest(self, key: str, var_confidence: float, test_confidence: float = 0.95) -> dict:

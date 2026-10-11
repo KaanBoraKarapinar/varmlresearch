@@ -159,7 +159,7 @@ class TrainedModel(ABC):
         """
         Fills a copy of self.residual_bank_in_sample with the standardized residuals of the
         whole forecast window and returns it. No VaR is computed here and no confidence is involved:
-        read the VaR afterwards with calendar.var_from_residual_bank(bank, var_confidence, run_key)
+        read the VaR afterwards with calendar.var_from_residual_bank_forecast_period(bank, var_confidence, run_key)
         (or bank.multi_day_var) at any confidence.
 
         calendar.forecast_dates is the single source of truth for which bars get scored.
@@ -193,7 +193,7 @@ class TrainedModel(ABC):
         (residual_bank, ewma_variance_bank): the EWMA bank gets the per-ticker model variances + realized
         ticker returns and yields the portfolio variances, which standardize the realized portfolio
         returns into the residual bank. No VaR is computed here and no confidence is involved: read the
-        VaR afterwards with calendar.var_from_residual_bank(bank, var_confidence, run_key) (or
+        VaR afterwards with calendar.var_from_residual_bank_forecast_period(bank, var_confidence, run_key) (or
         bank.multi_day_var) at any confidence.
 
         The banks come from the model (self.residual_bank_in_sample /
