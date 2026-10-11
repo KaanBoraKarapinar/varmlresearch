@@ -1,0 +1,367 @@
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+from var_backtest_utils import run_full_backtest_suite_single_window
+
+if TYPE_CHECKING:
+    from .ResidualBank import ResidualBank
+
+
+class VarPredictionRun:
+    """One named run of VaR forecasts: Date -> varForecast."""
+
+    def __init__(self, key: str, forecast_dates: pd.DatetimeIndex):
+        self.key = key
+        self.forecast_dates = forecast_dates
+        self.data = pd.DataFrame({"varForecast": np.nan}, index=forecast_dates)
+
+    def set(self, date, var_estimate: float) -> "VarPredictionRun":
+        date = pd.Timestamp(date)
+        if date not in self.forecast_dates:
+            raise KeyError(f"{date} not in this run's forecast_dates for key={self.key!r}")
+        self.data.loc[date, "varForecast"] = float(var_estimate)
+        return self
+
+    def set_batch(self, var_series: pd.Series) -> "VarPredictionRun":
+        missing = pd.DatetimeIndex(var_series.index).difference(self.forecast_dates)
+        if len(missing):
+            raise KeyError(f"dates outside forecast_dates for key={self.key!r}: {list(missing)}")
+        self.data.loc[var_series.index, "varForecast"] = var_series.to_numpy(dtype=float)
+        return self
+
+    def dropna(self) -> pd.DataFrame:
+        return self.data.dropna()
+
+
+class GroundTruthCalendar:
+    def __init__(
+        self,
+        frequency: pd.Timedelta,
+        tickers_raw_price_data: pd.DataFrame,
+        tickers: list[str],
+        weights: dict[str, float] | pd.Series,
+        train_start,
+        train_end,
+        forecast_start,
+        forecast_end,
+        drop_market_closed: bool = True,
+    ):
+        if not isinstance(frequency, pd.Timedelta):
+            raise TypeError(f"frequency must be a pd.Timedelta, got {type(frequency)}")
+        if frequency <= pd.Timedelta(0):
+            raise ValueError(f"frequency must be positive: {frequency}")
+
+        missing = set(tickers) - set(tickers_raw_price_data.columns)
+        if missing:
+            raise ValueError(f"tickers_data is missing columns: {sorted(missing)}")
+
+        self.frequency = frequency
+        self.tickers = list(tickers)
+        self.weights = self._validate_weights(self.tickers, weights)
+
+        pct_returns = self._calculate_pct_return(tickers_raw_price_data)
+
+        full_data = self._compute_portfolio_return_and_loss_FOR_PCT_RETURN(pct_returns, self.tickers, self.weights)
+
+        self.train_start, self.train_end, self.forecast_start, self.forecast_end = self._validate_windows(
+            full_data, train_start, train_end, forecast_start, forecast_end
+        )
+
+        self.train_data = self._slice_with_gap_check(full_data, self.train_start, self.train_end, "train", drop_market_closed)
+        self.forecast_data = self._slice_with_gap_check(full_data, self.forecast_start, self.forecast_end, "forecast", drop_market_closed)
+        self.forecast_dates = self.forecast_data.index
+
+        # The last TRAIN bar's (target-less) feature row prices forecast_dates[0]. Defined once here so the
+        # feature builders (which feature rows to compute) and forecast_pairs (which pairs to form) agree.
+        self.train_data_last_index = self.train_data.index[-1:]
+        self.forecast_feature_dates = self.train_data_last_index.append(self.forecast_dates)
+
+        # Forecast-phase scoring pairs (feature_dates, outcome_dates), built once: feature_dates[i] is the bar
+        # immediately before outcome_dates[i], drawn by position (not frequency subtraction, for the same
+        # skip-weekends/holidays reason as next_bars). outcome_dates is every forecast date; feature_dates is the
+        # last TRAIN bar followed by forecast_dates[:-1], so forecast_dates[0] is priced from the last train bar's
+        # feature row and n forecast bars give n pairs.
+        self.forecast_pairs = (self.forecast_feature_dates[:-1], self.forecast_dates)
+
+        # DANGEROUS: train_data + forecast_data concatenated. Only for feature builders
+        # that need rolling-window history to reach into train_data at the start of the forecast window (warmup)
+        self.DANGEROUS_merged_warmedup_FORECAST_data = pd.concat([self.train_data, self.forecast_data]).sort_index()
+
+
+        self.var_prediction_runs: dict[str, VarPredictionRun] = {}
+
+    @staticmethod
+    def _validate_weights(tickers: list[str], weights: dict[str, float] | pd.Series) -> pd.Series:
+        weights = pd.Series(weights, dtype=float)
+        missing_weights = set(tickers) - set(weights.index)
+        if missing_weights:
+            raise ValueError(f"Missing weights for tickers: {sorted(missing_weights)}")
+        if not np.isfinite(weights.to_numpy()).all():
+            raise ValueError("Weights must be finite.")
+        if np.isclose(weights.sum(), 0.0):
+            raise ValueError("Weights sum to zero.")
+        return weights.loc[tickers] / weights.loc[tickers].sum()
+
+    @staticmethod
+    def _calculate_pct_return(tickers_raw_price_data: pd.DataFrame) -> pd.DataFrame:
+        return tickers_raw_price_data.sort_index().pct_change()
+
+
+    @staticmethod
+    def _compute_portfolio_return_and_loss_FOR_PCT_RETURN(tickers_pct_change_data: pd.DataFrame, tickers: list[str], weights: pd.Series) -> pd.DataFrame:
+        full_data = tickers_pct_change_data.sort_index().copy()
+        portfolio_return = full_data[tickers].mul(weights, axis="columns").sum(axis=1, min_count=len(tickers))
+        full_data["portfolio_return"] = portfolio_return
+        full_data["portfolio_loss"] = -portfolio_return
+        return full_data
+
+    @staticmethod
+    def _warn_if_wrong_weekday(ts: pd.Timestamp, label: str, expect: str) -> None:
+        actual = ts.day_name()
+        if actual != expect:
+            print(f"[WARNING] {label}={ts.date().isoformat()} falls on {actual}, expected {expect} (using it as-is).")
+
+    def _slice_with_gap_check(self, full_data, start, end, label, drop_market_closed):
+        sliced = full_data.loc[start:end]
+        n_business_days_dropped = 0
+
+        if self.frequency == pd.Timedelta(hours=24):
+            expected_business_days = pd.date_range(start, end, freq="B")
+            missing_business_days = expected_business_days.difference(sliced.index)
+            n_business_days_dropped = len(missing_business_days)
+
+            if n_business_days_dropped:
+                dates_str = ", ".join(d.isoformat() for d in missing_business_days.date[:5])  # pyright: ignore[reportAttributeAccessIssue]
+                suffix = f" and {n_business_days_dropped - 5} more" if n_business_days_dropped > 5 else ""
+                day_word = "day" if n_business_days_dropped == 1 else "days"
+                msg = (
+                    f"[{label}] {n_business_days_dropped} weekday {day_word} had no data and were skipped "
+                    f"(likely market holidays): {dates_str}{suffix}"
+                )
+
+                if drop_market_closed:
+                    print(f"[WARNING] {msg}")
+                else:
+                    raise ValueError(msg)
+
+        if sliced.empty:
+            raise ValueError(f"[{label}] no bars left in [{start} .. {end}] after slicing.")
+
+        bar_word = "bar" if len(sliced) == 1 else "bars"
+        print(
+            f"[INFO] {label} set: {len(sliced)} {bar_word}, {n_business_days_dropped} weekday {'day' if n_business_days_dropped == 1 else 'days'} skipped")
+
+        return sliced.copy()
+
+    @classmethod
+    def _validate_windows(cls, full_data, train_start, train_end, forecast_start, forecast_end) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+        train_start = pd.Timestamp(train_start)
+        train_end = pd.Timestamp(train_end)
+        forecast_start = pd.Timestamp(forecast_start)
+        forecast_end = pd.Timestamp(forecast_end)
+
+        bounds = (full_data.index[0], full_data.index[-1]) if len(full_data) else (None, None)
+
+        for label, ts in (
+            ("train_start", train_start), ("train_end", train_end),
+            ("forecast_start", forecast_start), ("forecast_end", forecast_end),
+        ):
+            if ts not in full_data.index:
+                raise KeyError(f"{label}={ts} is not a bar in tickers_data (range: {bounds})")
+
+        if not (train_start <= train_end):
+            raise ValueError(f"train_start {train_start} is after train_end {train_end}")
+        if not (train_end < forecast_start):
+            raise ValueError(f"train_end {train_end} must be strictly before forecast_start {forecast_start} (no look-ahead)")
+        if not (forecast_start <= forecast_end):
+            raise ValueError(f"forecast_start {forecast_start} is after forecast_end {forecast_end}")
+
+        cls._warn_if_wrong_weekday(train_start, "train_start", expect="Monday")
+        cls._warn_if_wrong_weekday(train_end, "train_end", expect="Friday")
+        cls._warn_if_wrong_weekday(forecast_start, "forecast_start", expect="Monday")
+        cls._warn_if_wrong_weekday(forecast_end, "forecast_end", expect="Friday")
+
+        return train_start, train_end, forecast_start, forecast_end
+
+    def describe_split(self) -> pd.DataFrame:
+        train_rows = pd.DataFrame({"split": "train"}, index=self.train_data.index)
+        forecast_rows = pd.DataFrame({"split": "forecast"}, index=self.forecast_data.index)
+        return pd.concat([train_rows, forecast_rows]).sort_index()
+
+    def next_bars(self, dates) -> pd.DatetimeIndex:
+        """
+        Position-based next bar for each date in `dates`, looked up against the full
+        train+forecast calendar (DANGEROUS_merged_warmedup_FORECAST_data) -- so a date
+        sitting at the train/forecast boundary (e.g. train_end) still resolves to its
+        true next bar in forecast_data. Position-based, not frequency-based, so it
+        correctly skips weekends/holidays instead of naively adding a fixed offset.
+        """
+        index = self.DANGEROUS_merged_warmedup_FORECAST_data.index
+        dates = pd.DatetimeIndex(dates)
+        positions = index.get_indexer(dates)
+        if (positions == -1).any():
+            bad = dates[positions == -1]
+            raise KeyError(f"Dates not found in calendar: {list(bad)}")
+        if (positions + 1 >= len(index)).any():
+            bad = dates[positions + 1 >= len(index)]
+            raise KeyError(f"Dates have no following bar in calendar: {list(bad)}")
+        return index[positions + 1]
+
+    def previous_bars(self, dates) -> pd.DatetimeIndex:
+        """
+        Position-based previous bar for each date in `dates`, the mirror of next_bars: looked up against the
+        full train+forecast calendar (DANGEROUS_merged_warmedup_FORECAST_data), so it skips weekends/holidays
+        instead of subtracting a fixed offset (a Monday's previous bar is the Friday, not the Sunday).
+        """
+        index = self.DANGEROUS_merged_warmedup_FORECAST_data.index
+        dates = pd.DatetimeIndex(dates)
+        positions = index.get_indexer(dates)
+        if (positions == -1).any():
+            bad = dates[positions == -1]
+            raise KeyError(f"Dates not found in calendar: {list(bad)}")
+        if (positions - 1 < 0).any():
+            bad = dates[positions - 1 < 0]
+            raise KeyError(f"Dates have no preceding bar in calendar: {list(bad)}")
+        return index[positions - 1]
+
+    def usable_train_dates(self, candidate_dates, min_periods: int) -> pd.DatetimeIndex:
+        """
+        Intersects `candidate_dates` (e.g. a TrainingFeature's own common_dates --
+        already restricted by that feature's own per-ticker NaN/warmup drops, which the
+        calendar has no visibility into) with train_data dates that have >= min_periods
+        prior train bars available (survived burn-in). Prints the comparison so a caller
+        can see, e.g., that feature warmup already pushed the effective train start later
+        than train_data's own start, or how many candidate dates got cut by burn-in.
+        """
+        candidate_dates = pd.DatetimeIndex(candidate_dates)
+        burned_in = self.train_data.index[min_periods:]
+        usable_dates = candidate_dates[candidate_dates.isin(burned_in)]
+
+        n_candidates = len(candidate_dates)
+        n_usable = len(usable_dates)
+        n_dropped = n_candidates - n_usable
+        burn_in_start = burned_in[0].date() if len(burned_in) else "N/A"
+        print(
+            f"[INFO] usable_train_dates: {n_usable}/{n_candidates} candidate dates survived "
+            f"burn-in (min_periods={min_periods}, train_data starts {self.train_data.index[0].date()}, "
+            f"burn-in cutoff {burn_in_start}, {n_dropped} candidate date(s) dropped)."
+        )
+
+        if usable_dates.empty:
+            raise ValueError(f"usable_train_dates: no candidate dates survived burn-in (min_periods={min_periods}).")
+        return usable_dates
+
+    #def _lookup(self, date) -> pd.Series:
+        #date = pd.Timestamp(date)
+        #if date in self.train_data.index:
+            #return self.train_data.loc[date]
+        #if date in self.forecast_data.index:
+            #return self.forecast_data.loc[date]
+        #raise KeyError(f"{date} is not in train_data or forecast_data (embargo gap, dropped non-trading day, or out of range).")
+
+
+    #def ticker_returns(self) -> pd.DataFrame:
+        #return pd.concat([self.train_data[self.tickers], self.forecast_data[self.tickers]]).sort_index()
+
+    #def realized_return(self, date) -> float:
+        #return float(self._lookup(date)["portfolio_return"])
+
+    #def realized_loss(self, date) -> float:
+        #return float(self._lookup(date)["portfolio_loss"])
+
+    def _get_or_create_run(self, key: str) -> VarPredictionRun:
+        if key not in self.var_prediction_runs:
+            self.var_prediction_runs[key] = VarPredictionRun(key, self.forecast_dates)
+        return self.var_prediction_runs[key]
+
+    def add_predicted_var(self, key: str, date, var_estimate: float) -> "GroundTruthCalendar":
+        self._get_or_create_run(key).set(date, var_estimate)
+        return self
+
+    def add_predicted_var_batch(self, key: str, var_series: pd.Series) -> "GroundTruthCalendar":
+        self._get_or_create_run(key).set_batch(var_series)
+        return self
+
+    def var_from_residual_bank(
+        self,
+        bank: "ResidualBank",
+        var_confidence: float,
+        multi_day_var_calculation_window_size: int | None,
+        run_key: str,
+        multi_day_var_min_periods: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        Reads the VaR of every forecast date off a bank that already holds the forecast window's
+        residuals (see calculate_multi_day_standart_residuals_from_*), adds the realized loss and records
+        the run under run_key (reusing a key overwrites that run).
+        How to read is chosen here, per call: var_confidence, the quantile window (None = expanding) and
+        its min_periods, see ResidualBank.multi_day_var.
+        """
+        var_df = bank.multi_day_var(
+            self.forecast_dates, var_confidence, multi_day_var_calculation_window_size, multi_day_var_min_periods
+        )
+        var_df["loss"] = self.forecast_data.loc[var_df.index, "portfolio_loss"]
+        self.add_predicted_var_batch(run_key, var_df["varForecast"])
+        return var_df
+
+    def backtest(self, key: str, var_confidence: float, test_confidence: float = 0.95) -> dict:
+        if key not in self.var_prediction_runs:
+            raise KeyError(f"No run recorded under key={key!r}. Recorded keys: {list(self.var_prediction_runs)}")
+
+        run_df = self.var_prediction_runs[key].dropna()
+        if run_df.empty:
+            raise ValueError(f"var_prediction_runs[{key!r}] is empty, nothing to backtest.")
+
+        forecast_df = run_df.join(self.forecast_data["portfolio_loss"].rename("loss"))
+
+        return run_full_backtest_suite_single_window(
+            forecast_df=forecast_df,
+            start_date=forecast_df.index.min(),
+            end_date=forecast_df.index.max(),
+            var_confidence=var_confidence,
+            test_confidence=test_confidence,
+        )
+
+
+class DailyGroundTruthCalendar(GroundTruthCalendar):
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+
+
+class HourlyGroundTruthCalendar(GroundTruthCalendar):
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+
+
+class MinuteGroundTruthCalendar(GroundTruthCalendar):
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
+        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+
+
+def plot_var_runs(calendar: GroundTruthCalendar, keys: list[str], title: str = "VaR Forecast vs Loss") -> "go.Figure":
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    for key in keys:
+        if key not in calendar.var_prediction_runs:
+            raise KeyError(f"No run recorded under key={key!r}. Recorded keys: {list(calendar.var_prediction_runs)}")
+
+        run_df = calendar.var_prediction_runs[key].dropna()
+        fig.add_scatter(x=run_df.index, y=run_df["varForecast"], mode="lines", name=f"VaR Forecast ({key})")
+
+    reference_key = keys[0]
+    loss_df = calendar.var_prediction_runs[reference_key].dropna()
+    loss_series = calendar.data.loc[loss_df.index, "portfolio_loss"]
+    fig.add_scatter(x=loss_series.index, y=loss_series, mode="lines", name="Loss")
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title="Value",
+        template="plotly_white",
+    )
+    return fig

@@ -6,8 +6,9 @@ Run from anywhere with: python3 MLProject/smoke_test_var_pipeline.py
 (or `python3 smoke_test_var_pipeline.py` from inside MLProject/).
 
 Exercises both the wide and long paths end to end:
-    build_*_features -> xgboost_train(window_size=...) -> residual_bank_in_sample
-    (+ ewma_variance_bank_in_sample for long) -> multi_day_var_from_*
+    build_*_features -> xgboost_train(residual_bank=...) -> residual_bank_in_sample
+    (+ ewma_variance_bank_in_sample for long) -> calculate_multi_day_standart_residuals_from_*
+    -> calendar.var_from_residual_bank
 """
 import sys
 from pathlib import Path
@@ -27,19 +28,25 @@ import tree_models as tm
 TICKERS = ["AAPL", "JPM", "XOM", "KO"]
 WEIGHTS = {"AAPL": 0.25, "JPM": 0.25, "XOM": 0.25, "KO": 0.25}
 
-WINDOW_SIZE = 20
 VAR_CONFIDENCE = 0.95
+VAR_WINDOW = 60       # how the VaR is READ (chosen per call, not a bank setting)
+VAR_MIN_PERIODS = 30
 
 _df = pd.read_csv(_HERE / "data_general" / "4_ticker_data.csv", parse_dates=["Date"], index_col="Date")
-TICKERS_RETURNS = _df[TICKERS].pct_change().dropna()
+PRICES = _df[TICKERS]  # raw prices: the calendar takes pct_change itself
 
 
 def make_calendar() -> dm.DailyGroundTruthCalendar:
     return dm.DailyGroundTruthCalendar(
-        TICKERS_RETURNS, TICKERS, WEIGHTS,
+        PRICES, TICKERS, WEIGHTS,
         train_start="2024-06-03", train_end="2024-11-29",
         forecast_start="2024-12-02", forecast_end="2024-12-31",
     )
+
+
+def make_residual_bank() -> dm.ResidualBank:
+    # single-use: training fills it in place, so every run needs its own bank
+    return dm.ResidualBank(mu_mode="constant", default_mu_hat=0.0, rolling_mu_hat_window_size=20)
 
 
 def run_wide() -> pd.DataFrame:
@@ -47,12 +54,14 @@ def run_wide() -> pd.DataFrame:
     calendar = make_calendar()
     training_feature, forecast_feature = fb.build_wide_features(calendar)
 
-    model = tm.xgboost_train(calendar, training_feature, WINDOW_SIZE)
+    model = tm.xgboost_train(calendar, training_feature, residual_bank=make_residual_bank())
     assert not model.residual_bank_in_sample.residuals.empty, "wide residual_bank_in_sample is empty"
     print(f"residual_bank_in_sample seeded with {len(model.residual_bank_in_sample.residuals)} rows")
 
-    var_df = dm.multi_day_var_from_pretrained_model(model, forecast_feature, calendar, WINDOW_SIZE, VAR_CONFIDENCE)
-    assert not var_df.empty, "multi_day_var_from_pretrained_model returned an empty DataFrame"
+    bank = dm.calculate_multi_day_standart_residuals_from_wide_format_model(model, calendar, forecast_feature)
+    var_df = calendar.var_from_residual_bank(
+        bank, VAR_CONFIDENCE, VAR_WINDOW, run_key="smoke_wide", multi_day_var_min_periods=VAR_MIN_PERIODS)
+    assert len(var_df) == len(calendar.forecast_dates), "wide: one VaR per forecast bar expected"
     assert var_df["varForecast"].notna().all(), "NaN in wide varForecast"
     assert var_df["loss"].notna().all(), "NaN in wide loss"
     print(var_df.head())
@@ -65,17 +74,16 @@ def run_long() -> pd.DataFrame:
     calendar = make_calendar()
     training_feature, forecast_feature = fb.build_long_features(calendar)
 
-    model = tm.xgboost_train(calendar, training_feature, WINDOW_SIZE)
+    model = tm.xgboost_train(calendar, training_feature, residual_bank=make_residual_bank())
     assert not model.residual_bank_in_sample.residuals.empty, "long residual_bank_in_sample is empty"
     assert model.ewma_variance_bank_in_sample is not None, "ewma_variance_bank_in_sample was not seeded"
     print(f"residual_bank_in_sample seeded with {len(model.residual_bank_in_sample.residuals)} rows")
     print(f"ewma_variance_bank_in_sample seeded with {len(model.ewma_variance_bank_in_sample.portfolio_variance)} rows")
 
-    var_df = dm.multi_day_var_from_long_format_model(
-        model, calendar, forecast_feature, WINDOW_SIZE, VAR_CONFIDENCE,
-        model.residual_bank_in_sample, model.ewma_variance_bank_in_sample,
-    )
-    assert not var_df.empty, "multi_day_var_from_long_format_model returned an empty DataFrame"
+    bank, ewma_bank = dm.calculate_multi_day_standart_residuals_from_long_format_model(model, calendar, forecast_feature)
+    var_df = calendar.var_from_residual_bank(
+        bank, VAR_CONFIDENCE, VAR_WINDOW, run_key="smoke_long", multi_day_var_min_periods=VAR_MIN_PERIODS)
+    assert len(var_df) == len(calendar.forecast_dates), "long: one VaR per forecast bar expected"
     assert var_df["varForecast"].notna().all(), "NaN in long varForecast"
     assert var_df["loss"].notna().all(), "NaN in long loss"
     print(var_df.head())

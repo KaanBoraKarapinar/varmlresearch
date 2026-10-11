@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from data_management import *
+import pandas as pd
+
+from core import TrainingFeature, ForecastFeature, GroundTruthCalendar
 
 
 # %%
@@ -72,7 +74,8 @@ def build_wide_features(
         raise ValueError(
             f"No usable (target-known) rows in train window [{calendar.train_start} .. {calendar.train_end}].")
 
-    forecast_df, _ = _build_common(merged_returns, calendar.forecast_data.index, "wide forecast")
+    # calendar.forecast_feature_dates = last train bar + forecast dates (the last train bar's feature row prices forecast_dates[0])
+    forecast_df, _ = _build_common(merged_returns, calendar.forecast_feature_dates, "wide forecast")
     if forecast_df.empty:
         raise ValueError(f"No usable rows in forecast window [{calendar.forecast_start} .. {calendar.forecast_end}].")
     r_next_forecast = merged_returns["portfolio_return"].shift(-1)
@@ -166,7 +169,8 @@ def build_long_features(
         return result
 
     train_full = _finalize(train_long, calendar.train_data.index, "long train")
-    forecast_full = _finalize(merged_long, calendar.forecast_data.index, "long forecast")
+    # calendar.forecast_feature_dates = last train bar + forecast dates (the last train bar's feature rows price forecast_dates[0])
+    forecast_full = _finalize(merged_long, calendar.forecast_feature_dates, "long forecast")
 
     if train_full.empty:
         raise ValueError(
