@@ -15,8 +15,12 @@ def DATA_QUALITY_check_variance_floor(predicted_variances, dates=None, context: 
         n_bad = int(bad_mask.sum())
         if dates is not None:
             dates = pd.DatetimeIndex(np.atleast_1d(dates))
-            bad_dates = list(dates[bad_mask][:5])
-            location = f" at dates (first 5): {bad_dates}"
+            if len(dates) == len(values):
+                bad_dates = list(dates[bad_mask][:5])
+                location = f" at dates (first 5): {bad_dates}"
+            else:
+                # e.g. one date with one value per ticker: report the date and the offending positions
+                location = f" at dates {list(dates[:5])} (value positions: {list(np.flatnonzero(bad_mask)[:5])})"
         else:
             location = ""
 

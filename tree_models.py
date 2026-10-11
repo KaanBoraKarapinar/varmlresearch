@@ -41,93 +41,6 @@ class TrainedTreeModel(TrainedModel):
 
 
 
-def long_format_train_seed(
-    pooled_model: TrainedModel,
-    calendar: GroundTruthCalendar,
-    training_feature: TrainingFeature,
-    residual_bank: ResidualBank,
-    ewma_bank: EwmaVarianceBank,
-) -> tuple[ResidualBank, EwmaVarianceBank]:
-    """
-    Builds the portfolio-level in-sample ResidualBank + EwmaVarianceBank for a
-    pooled long-format model, to be used as residual_bank_in_sample /
-    ewma_variance_bank_in_sample.
-
-    Diagonal (per-ticker variance) comes from pooled_model via
-    predict_variance_batch_long_by_ticker, off-diagonal (correlation) from EWMA on
-    calendar.train_data ONLY (never touches forecast-period returns, so no
-    leakage). Portfolio variance = w^T Sigma_hat w, computed by
-    EwmaVarianceBank.add()/general_bulk_insert().
-
-    Bank entries are labeled by the OUTCOME day (own-day rule): Date=X holds the
-    actual_return that REALLY happened on X, and the predicted_variance that was
-    produced from X's own preceding feature bar.
-
-    training_feature.X_out_sample_last_index (the window's final feature row, no known target
-    yet) is NOT seeded here: its outcome is forecast_dates[0], which the forecast phase prices
-    itself through calendar.forecast_pairs.
-
-    residual_bank / ewma_bank are SINGLE-USE: they carry the settings (mu_mode, default_mu_hat,
-    rolling_mu_hat_window_size, quantile window, ewma_lam, ewma_min_periods, ...), are filled IN PLACE here and
-    marked `trained` (start_training). A bank that was already used raises instead of leaking into a new run.
-    The returned banks are the same objects that were passed in.
-    """
-    if training_feature.type != "long":
-        raise ValueError(f"long_format_train_seed requires a long-format TrainingFeature, got type={training_feature.type!r}")
-    if training_feature.X_in_sample_id_cols is None:
-        raise ValueError("long_format_train_seed requires training_feature.X_in_sample_id_cols (Date/ticker per row).")
-    # checked up front so a refused run leaves neither bank half-filled
-    if residual_bank.trained or ewma_bank.trained:
-        raise ValueError("residual_bank / ewma_bank were already used for training; create new banks for every training run.")
-
-    tickers = calendar.tickers
-
-    # feature_dates is now the feature builder's responsibility (TrainingFeature.feature_dates),
-    # not recomputed here from X_in_sample_id_cols.
-    feature_dates = training_feature.feature_dates
-    diag_by_ticker = pooled_model.predict_variance_batch_long_by_ticker(training_feature.X_in_sample, training_feature.X_in_sample_id_cols, feature_dates)
-    sigma_diag_df = pd.DataFrame({t: diag_by_ticker[t].to_numpy() for t in tickers}, index=feature_dates)
-
-    # ---- EWMA correlation, TRAIN-ONLY returns ----
-    train_returns = calendar.train_data[tickers].sort_index()
-    ewma_min_periods = ewma_bank.ewma_min_periods
-    ewma_bank.start_training(calendar).training_safe_bulk_insert(
-        train_returns.iloc[:ewma_min_periods]
-    )
-    # usable_dates: feature_dates that are also past the calendar's own EWMA burn-in
-    # window (a covariance to price against). Threshold is ewma_min_periods - 1, not
-    # ewma_min_periods: the seed window's own last bar (position ewma_min_periods - 1)
-    # is a valid feature address too -- the seed cov it produces already encodes that
-    # bar (see EwmaVarianceBank.training_safe_bulk_insert), so it needs no extra prior
-    # history beyond the seed itself. X_in_sample never contains the last
-    # train date (its target/r_next is NaN by construction), so usable_dates always
-    # has a following bar -- calendar.next_bars gives outcome_dates, their paired
-    # own-day OUTCOME bar.
-    usable_dates = calendar.usable_train_dates(feature_dates, ewma_min_periods - 1)
-    outcome_dates = calendar.next_bars(usable_dates)
-
-    # own-day rule: sigma_diag_df is forecast made FROM usable_dates[i]'s features, which is
-    # FOR outcome_dates[i] -- re-key it to outcome_dates so general_bulk_insert's EWMA
-    # recursion (keyed/stepped by outcome day) lines up with the diagonal it's paired with,
-    # same convention calculate_multi_day_standart_residuals_from_long_format_model uses for the forecast phase.
-    sigma_diag_outcome = sigma_diag_df.loc[usable_dates].set_axis(outcome_dates)
-    portfolio_variances = ewma_bank.general_bulk_insert(outcome_dates, train_returns, sigma_diag_outcome)
-
-    # training_safe_bulk_insert (not general_bulk_insert) because the bank starts empty here:
-    # general_bulk_insert needs rolling_mu_hat_window_size bars of PRIOR history to already be
-    # IN the bank before it can compute a rolling mu_hat, which a from-scratch seed can
-    # never satisfy for its own first rolling_mu_hat_window_size dates. training_safe_bulk_insert
-    # ramps the stateful mu_hat up from scratch instead (step_1/step_2), so it works from empty.
-    residual_bank.start_training(outcome_dates[0], calendar.frequency)
-    residual_bank.training_safe_bulk_insert(
-        dates=outcome_dates,
-        actual_returns=calendar.train_data.loc[outcome_dates, "portfolio_return"].to_numpy(),
-        predicted_variances=portfolio_variances.to_numpy(),
-    )
-
-    return residual_bank, ewma_bank
-
-
 def _tree_train_long(
     calendar: GroundTruthCalendar, training_feature: TrainingFeature, model_constructor, model_name: str,
     model_kwargs: dict, residual_bank: ResidualBank, ewma_bank: EwmaVarianceBank,
@@ -147,8 +60,8 @@ def _tree_train_long(
         target_scale=training_feature.target_scale, feature_cols=training_feature.feature_cols,
     )
 
-    trained_model.residual_bank_in_sample, trained_model.ewma_variance_bank_in_sample = long_format_train_seed(
-        trained_model, calendar, training_feature, residual_bank, ewma_bank,
+    trained_model.residual_bank_in_sample, trained_model.ewma_variance_bank_in_sample = trained_model.long_format_calculate_training_standartized_residuals(
+        calendar, training_feature, residual_bank, ewma_bank,
     )
     return trained_model
 
@@ -172,9 +85,9 @@ def _tree_train_wide(
 
     # training_safe_bulk_insert (not general_bulk_insert): the bank starts empty, and
     # general_bulk_insert can never seed a from-scratch bank (see
-    # long_format_train_seed for the full explanation). training_safe_bulk_insert ramps the
+    # TrainedModel.long_format_calculate_training_standartized_residuals for the full explanation). training_safe_bulk_insert ramps the
     # stateful mu_hat up from scratch instead.
-    # residual_bank is SINGLE-USE: bound to this run and filled in place, see long_format_train_seed
+    # residual_bank is SINGLE-USE: bound to this run and filled in place, see TrainedModel.long_format_calculate_training_standartized_residuals
     residual_bank.start_training(common_index[0], training_feature.frequency)
     residual_bank.training_safe_bulk_insert(
         dates=common_index,

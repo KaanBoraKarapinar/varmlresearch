@@ -43,7 +43,9 @@ def build_wide_features(
         r["portfolio_return"] = df["portfolio_return"]
         return r
 
-    train_returns = _returns(calendar.train_data)
+    # warmup bars (before train_start) only warm up the rolling windows: _build_common keeps just the train rows,
+    # so their returns never become a training row or a target
+    train_returns = _returns(calendar.train_data_with_warmup)
     merged_returns = _returns(calendar.DANGEROUS_merged_warmedup_FORECAST_data)
 
     def _build_common(returns_df: pd.DataFrame, keep_index: pd.Index, label: str) -> tuple[pd.DataFrame, list[str]]:
@@ -150,7 +152,8 @@ def build_long_features(
 
         return long
 
-    train_long = _build_long(calendar.train_data)
+    # warmup bars (before train_start) only warm up the rolling windows; _finalize keeps the train rows
+    train_long = _build_long(calendar.train_data_with_warmup)
     merged_long = _build_long(calendar.DANGEROUS_merged_warmedup_FORECAST_data)
 
     feature_cols = [c for c in train_long.columns if c not in ("Date", "ticker", "r_next", "target")]

@@ -11,7 +11,3 @@ from .GroundTruthCalendar import (
 from .ResidualBank import ResidualBank, RESIDUAL_COLS, VARIANCE_FLOOR, DEFAULT_EXPANDING_MIN_PERIODS
 from .EwmaVarianceBank import EwmaVarianceBank
 from .TrainedModel import TrainedModel
-from .residual_calculation import (
-    calculate_multi_day_standart_residuals_from_wide_format_model,
-    calculate_multi_day_standart_residuals_from_long_format_model,
-)

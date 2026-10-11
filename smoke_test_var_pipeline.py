@@ -58,7 +58,7 @@ def run_wide() -> pd.DataFrame:
     assert not model.residual_bank_in_sample.residuals.empty, "wide residual_bank_in_sample is empty"
     print(f"residual_bank_in_sample seeded with {len(model.residual_bank_in_sample.residuals)} rows")
 
-    bank = dm.calculate_multi_day_standart_residuals_from_wide_format_model(model, calendar, forecast_feature)
+    bank = model.calculate_multi_day_standart_residuals_from_wide_format_model(calendar, forecast_feature)
     var_df = calendar.var_from_residual_bank(
         bank, VAR_CONFIDENCE, VAR_WINDOW, run_key="smoke_wide", multi_day_var_min_periods=VAR_MIN_PERIODS)
     assert len(var_df) == len(calendar.forecast_dates), "wide: one VaR per forecast bar expected"
@@ -80,7 +80,7 @@ def run_long() -> pd.DataFrame:
     print(f"residual_bank_in_sample seeded with {len(model.residual_bank_in_sample.residuals)} rows")
     print(f"ewma_variance_bank_in_sample seeded with {len(model.ewma_variance_bank_in_sample.portfolio_variance)} rows")
 
-    bank, ewma_bank = dm.calculate_multi_day_standart_residuals_from_long_format_model(model, calendar, forecast_feature)
+    bank, ewma_bank = model.calculate_multi_day_standart_residuals_from_long_format_model(calendar, forecast_feature)
     var_df = calendar.var_from_residual_bank(
         bank, VAR_CONFIDENCE, VAR_WINDOW, run_key="smoke_long", multi_day_var_min_periods=VAR_MIN_PERIODS)
     assert len(var_df) == len(calendar.forecast_dates), "long: one VaR per forecast bar expected"

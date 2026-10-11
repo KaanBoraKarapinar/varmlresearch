@@ -30,6 +30,12 @@ forecast_end="2024-12-31",
 * Ayrica, elimizde sadece trading günleri kayitli oldugu icin tahmin yapilacakken "gün - 1" yerine "index -1" deki veriye bakilir. 
 * Bunu saglamak icin uretetilirken trainin baslangic ve bitis, yapilacak forecastin baslangic ve bitis gunlerini alir.
 
+
+### warmup_bar
+train_start öncesi, Feature generation burnuplarinda ve EWMA bankdaki ilk covariance matrix  hesaplamasinda training perioddaki verilerin atilmamasi icin, ekstra önceki dönemden veri baglamak icin train_start öncesindeki veriler dahil edilebilir. bunlar sadece rolling fonksiyonlarin hesaplanamsinda kullanilir, kendi return degerleri vs. veri icerisinde olmaz.
+
+Varsayilan = 0, eger training datanin ilk kismi 
+
 ## Butun tarih yonetiminde temel kural: own-day (sahip gün) etiketlemesi
 
 Bank'larda (`ResidualBank`, `EwmaVarianceBank`) bir satırın tarihi **outcome günüdür**:
@@ -38,22 +44,27 @@ Bank'larda (`ResidualBank`, `EwmaVarianceBank`) bir satırın tarihi **outcome g
 
 # Tarihler
 
-| Terim                           | Anlam                                                                                                                                                                                                                                                   | nerede üretilir |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-|                                 |                                                                                                                                                                                                                                                         |                 |
-| `TrainingFeature.feature_dates` | Eğitimde hedefi bilinen feature satırlarının tarihleri, feature warm up lari (rolling pencerler vs hesaplanirrken) sonrasi survive eden  degerleri Yukaridaki grafikteki siyah alan.<br><br>Dikkat: ewma brun in ayrica usable_dates ile uygulanir.<br> | feature builder |
-| `ForecastFeature.feature_dates` | Feature matrisinin gerçekten kapsadığı tarihler. Feature Builder forecast degeri olustururken                                                                                                                                                           | feature builder |
-| `calendar.forecast_dates`       | Calendar olusturulurken verilen parametre ile olusturulmus Tahmin penceresindeki **bütün** barlar (`forecast_start … forecast_end`, tatil/hafta sonu hariç) (yukaridaki grafikte yesil)<br>                                                             |                 |
-| calendar.forecast_pairs         | `calendar.forecast_dates` de kayitli indexler ve bir sonraki degerlerini verir. Cunku forecast tarihinde +1 tarihi icin inceleme yapilir.<br>                                                                                                           |                 |
-|                                 |                                                                                                                                                                                                                                                         |                 |
-| calendar.usable_train_dates     |                                                                                                                                                                                                                                                         |                 |
+| Terim                                                                         | Anlam                                                                                                                                                                                                                                                                                                                                                                                                               | nerede üretilir |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
+|                                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                     |                 |
+| `TrainingFeature.feature_dates`                                               | Eğitimde hedefi bilinen feature satırlarının tarihleri, feature warm up lari (rolling pencerler vs hesaplanirrken) sonrasi survive eden  degerleri Yukaridaki grafikteki siyah alan.<br><br>Dikkat: ewma brun in ayrica usable_dates ile uygulanir.<br>                                                                                                                                                             | feature builder |
+| `ForecastFeature.feature_dates`                                               | Feature matrisinin gerçekten kapsadığı tarihler. Feature Builder forecast degeri olustururken                                                                                                                                                                                                                                                                                                                       | feature builder |
+| `calendar.forecast_dates`                                                     | Calendar olusturulurken verilen parametre ile olusturulmus Tahmin penceresindeki **bütün** barlar (`forecast_start … forecast_end`, tatil/hafta sonu hariç) (yukaridaki grafikte yesil)<br>                                                                                                                                                                                                                         |                 |
+| calendar.forecast_pairs                                                       | `calendar.forecast_dates` de kayitli indexler ve bir sonraki degerlerini verir. Cunku forecast tarihinde +1 tarihi icin inceleme yapilir.<br>                                                                                                                                                                                                                                                                       |                 |
+|                                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                     |                 |
+|                                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                     |                 |
 
-# Veri
+| Terim                                                                         | Anlam                                                                                                                                                                                                                                                                                                                                                                                                                                      |     |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --- |
+| fonksiyon: calendar.train_dates_past_burn_in `candidate_dates, burn_in_bars`) | Takvimin basindaki tarihlerden  verilen burn_in_bars kadar degeri atar. Sonra takvim ile candidate_dates'i kiyaslar ve kesisenleri döndürür.<br><br>Ornek rakamlar**<br>:** takvim `[1, 2, 3, 4, 5, 6, 7, 8]`, `burn_in_bars = 3`, <br><br>candidate_dates ile verlilem `[2, 4, 5, 8]`.<br><br>- İlk 3 bar atılır, geçerli küme `[4, 5, 6, 7, 8]`.<br>- Aday 2 geçerli kümede yok, atılır.<br>- Sonuç: `[4, 5, 8]`.<br><br>Kullanim: EWMA  |     |
+# Veri Noktalari
+
 | Terim                                                         | Anlam                                                                                                                                                                                      | nerede üretilir |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
 | calendar.train_data                                           | verilen train_start ile train_end arasindaki data                                                                                                                                          |                 |
 | calendar.forecast_data                                        | verilen forecast_start ile forecast end arasindaki data<br><br>(ForecastFeaturenin aksine training döneminin son out of sample verisini tasimaz! Sadece forecast doneminin datasini tasir) |                 |
 | calendar.self.DANGEROUS_<br>merged_warmedup_<br>FORECAST_data | Train Data+ Forecast Data<br><br>DANGEROUS<br><br>-> ForecastFeature uretilirken Kullanilir<br>-> Ewma bank uretilirken kullanilir<br>                                                     |                 |
+| calendar. train_data_with_warmup                              | warmup periyodunu da kapsayan veri                                                                                                                                                         |                 |
 
 # Fonksiyonlar
 
@@ -330,9 +341,9 @@ general_bulk_insert(...)                                  96 eğitim satırı + 
 ###### `training_safe_bulk_insert(warmup_returns)`
 * TEMELDE:*
 * warmup_returns : trainingein ilk xyz verisi
-* ewma_min_periods kadar barin return degerleri uzerinden (varsayilan 30bar ) STANDART KOVARYANS matrixini olusturup current_sigma ya kaydeder
+* ewma_min_periods kadar barin return degerleri uzerinden (varsayilan 30bar ) STANDART KOVARYANS matrixini olusturup` current_sigma` ya kaydeder
+	* TEK BIR MATRIX olusturur, 30 ewma_min_periods barlik  baz alarak. 
 * ewma_min_periods dan fazla periyot verilirse, 
-
 
 ###### `_portfolio_variance_from_cov(cov, sigma_diag, weights)`
 * bir günun varyansindan (modelin hesapladigi) por
@@ -376,10 +387,10 @@ general_bulk_insert(...)                                  96 eğitim satırı + 
 
 ###  Training Residual Hesaplama Mantigi
 
-* ### Su anda model Training Period icerisindeki bütün degerler ile tek seferde egitiliyor ve `long_format_train_seed` ile tamamini verinin görmüs modelin tahmininin alinmasi ile training residual hesaplaniyor.
+* ### Su anda model Training Period icerisindeki bütün degerler ile tek seferde egitiliyor ve `long_format_calculate_training_standartized_residuals` ile tamamini verinin görmüs modelin tahmininin alinmasi ile training residual hesaplaniyor.
 
 
-#### Long Format Train Seed
+### long_format_calculate_training_standartized_residuals
 ```python
 long_format_train_seed(
 pooled_model: TrainedModel,
@@ -396,11 +407,25 @@ ewma_bank: EwmaVarianceBank,
 
 * Detayli Akis:
 * `predict_variance_batch_long_by_ticker` ile `training_feature.feature_dates` icin varianceler hesaplanir.
-* training safe bulk insert ile, "ewma_bank_min_periods" kadar tick ile ewmanin ilk 
+* usable_dates, ewma rekursyonunun yapilacagi, dolayisi ile training dönemi icin variancelerin/residulallarin hesaplanacagi dönemi isaret eder.
+* training safe bulk insert ile, "ewma_bank_min_periods" kadar tick ile ewmanin ilk kovaryans matrixini hesaplar.
+	* calendarda ewma_bank_min_periods a yetecek kadar warmup_bar var ise, usable_dates feature_dates ile baslar.
+		* hesaplamasi train_dates_past_burn_in ile yapilir
+	* yoksa burn in edilir, burn in ciktiktan sonraki periyot ile baslar
+* ilk kovaryans matrixini hesapladiktan sonra, usable_dates/outcome_dates icin recursiv olarak general_bulk_insert ile ewma ile portfolio variance hesaplamarini yapar.
+* bu portfolio variancelerini training_safe_bulk_insert icine koyar.
 
-* Verilen
+### calculate_multi_day_standart_residuals_from_wide_format_model, calculate_multi_day_standart_residuals_from_long_format_model 
 
-xgboost_train → tree_train → _tree_train_long → long_format_train_seed
+1. Modelin eğitimden gelen bank'ının **kopyasını** alır (modelin kendi bank'ı bozulmaz).
+2. `calendar.forecast_pairs`'ten `feature_dates` / `outcome_dates` çiftlerini alır. Tahmin feature gününden yapılır, sonuç ertesi günün (outcome) etiketiyle yazılır. İlk forecast günü, train'in son barının feature satırından fiyatlanır.
+3. Model her feature günü için varyans tahmin eder.
+4. O outcome günlerinin gerçekleşen portföy getirisini `calendar.forecast_data`'dan okur.
+5. `bank.general_bulk_insert(...)` ile her gün için standardize residual hesaplayıp ekler: kabaca `(gerçek getiri − mu_hat) / sqrt(tahmin varyans)`.
+6. Dolu bank'ı döndürür.
+
+
+
 
 
 # Long Format Training Akisi

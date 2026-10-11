@@ -48,7 +48,10 @@ class GroundTruthCalendar:
         forecast_start,
         forecast_end,
         drop_market_closed: bool = True,
+        warmup_bars: int = 0,
     ):
+        if not isinstance(warmup_bars, (int, np.integer)) or warmup_bars < 0:
+            raise ValueError(f"warmup_bars must be a non-negative int, got {warmup_bars!r}")
         if not isinstance(frequency, pd.Timedelta):
             raise TypeError(f"frequency must be a pd.Timedelta, got {type(frequency)}")
         if frequency <= pd.Timedelta(0):
@@ -74,6 +77,25 @@ class GroundTruthCalendar:
         self.forecast_data = self._slice_with_gap_check(full_data, self.forecast_start, self.forecast_end, "forecast", drop_market_closed)
         self.forecast_dates = self.forecast_data.index
 
+        # Warmup: `warmup_bars` real bars strictly BEFORE train_start. Past data only (no look-ahead): it is used to
+        # warm up rolling features and to seed the EWMA covariance so that the very first train bar already has a
+        # feature row and a covariance to be priced against, instead of dropping the first ~50 train bars.
+        # train_data itself stays pure (what you asked to train on); warmup bars are never training rows.
+        self.warmup_bars = int(warmup_bars)
+        before_train = full_data.loc[:self.train_start].iloc[:-1]
+        if len(before_train) < self.warmup_bars:
+            raise ValueError(
+                f"warmup_bars={self.warmup_bars} but only {len(before_train)} bar(s) exist before "
+                f"train_start={self.train_start.date()} in the price data."
+            )
+        self.warmup_data = before_train.iloc[len(before_train) - self.warmup_bars:].copy()
+        if self.warmup_bars and self.warmup_data[self.tickers + ["portfolio_return"]].isna().any().any():
+            raise ValueError(
+                f"warmup_bars={self.warmup_bars} reaches the first price bar (which has no return): "
+                f"use a smaller warmup_bars or a later train_start."
+            )
+        self.train_data_with_warmup = pd.concat([self.warmup_data, self.train_data])
+
         # The last TRAIN bar's (target-less) feature row prices forecast_dates[0]. Defined once here so the
         # feature builders (which feature rows to compute) and forecast_pairs (which pairs to form) agree.
         self.train_data_last_index = self.train_data.index[-1:]
@@ -86,9 +108,13 @@ class GroundTruthCalendar:
         # feature row and n forecast bars give n pairs.
         self.forecast_pairs = (self.forecast_feature_dates[:-1], self.forecast_dates)
 
-        # DANGEROUS: train_data + forecast_data concatenated. Only for feature builders
-        # that need rolling-window history to reach into train_data at the start of the forecast window (warmup)
-        self.DANGEROUS_merged_warmedup_FORECAST_data = pd.concat([self.train_data, self.forecast_data]).sort_index()
+        # DANGEROUS: (warmup +) train_data + forecast_data concatenated. Only for feature builders
+        # that need rolling-window history to reach into train_data at the start of the forecast window (warmup).
+        # It starts at the same bar as train_data_with_warmup, so a train-side and a forecast-side feature row of the
+        # same date are computed from the same history (the train_end row is identical on both sides).
+        self.DANGEROUS_merged_warmedup_FORECAST_data = pd.concat(
+            [self.warmup_data, self.train_data, self.forecast_data]
+        ).sort_index()
 
 
         self.var_prediction_runs: dict[str, VarPredictionRun] = {}
@@ -227,32 +253,32 @@ class GroundTruthCalendar:
             raise KeyError(f"Dates have no preceding bar in calendar: {list(bad)}")
         return index[positions - 1]
 
-    def usable_train_dates(self, candidate_dates, min_periods: int) -> pd.DatetimeIndex:
+    def train_dates_past_burn_in(self, candidate_dates, burn_in_bars: int) -> pd.DatetimeIndex:
         """
-        Intersects `candidate_dates` (e.g. a TrainingFeature's own common_dates --
-        already restricted by that feature's own per-ticker NaN/warmup drops, which the
-        calendar has no visibility into) with train_data dates that have >= min_periods
-        prior train bars available (survived burn-in). Prints the comparison so a caller
-        can see, e.g., that feature warmup already pushed the effective train start later
-        than train_data's own start, or how many candidate dates got cut by burn-in.
+        Drops the `candidate_dates` (e.g. a TrainingFeature's feature_dates) that still sit INSIDE the burn-in:
+        the first `burn_in_bars` bars of warmup + train. Only train dates that come after those bars have a
+        covariance built from strictly earlier data to be priced against.
+
+        With warmup_bars >= burn_in_bars the burn-in is covered by the warmup bars, so every train date is
+        returned and nothing is dropped; with warmup_bars = 0 it cuts the first burn_in_bars train bars.
+        Prints how many candidates survived, and raises if none did.
         """
         candidate_dates = pd.DatetimeIndex(candidate_dates)
-        burned_in = self.train_data.index[min_periods:]
-        usable_dates = candidate_dates[candidate_dates.isin(burned_in)]
+        past_burn_in = self.train_data_with_warmup.index[burn_in_bars:]
+        kept_dates = candidate_dates[candidate_dates.isin(past_burn_in)]
 
         n_candidates = len(candidate_dates)
-        n_usable = len(usable_dates)
-        n_dropped = n_candidates - n_usable
-        burn_in_start = burned_in[0].date() if len(burned_in) else "N/A"
+        n_kept = len(kept_dates)
+        cutoff = past_burn_in[0].date() if len(past_burn_in) else "N/A"
         print(
-            f"[INFO] usable_train_dates: {n_usable}/{n_candidates} candidate dates survived "
-            f"burn-in (min_periods={min_periods}, train_data starts {self.train_data.index[0].date()}, "
-            f"burn-in cutoff {burn_in_start}, {n_dropped} candidate date(s) dropped)."
+            f"[INFO] train_dates_past_burn_in: {n_kept}/{n_candidates} candidate dates are past the burn-in "
+            f"(burn_in_bars={burn_in_bars}, warmup_bars={self.warmup_bars}, train_data starts "
+            f"{self.train_data.index[0].date()}, burn-in ends {cutoff}, {n_candidates - n_kept} date(s) dropped)."
         )
 
-        if usable_dates.empty:
-            raise ValueError(f"usable_train_dates: no candidate dates survived burn-in (min_periods={min_periods}).")
-        return usable_dates
+        if kept_dates.empty:
+            raise ValueError(f"train_dates_past_burn_in: no candidate dates are past the burn-in (burn_in_bars={burn_in_bars}).")
+        return kept_dates
 
     #def _lookup(self, date) -> pd.Series:
         #date = pd.Timestamp(date)
@@ -327,18 +353,18 @@ class GroundTruthCalendar:
 
 
 class DailyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
+        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
 
 
 class HourlyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
+        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
 
 
 class MinuteGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True):
-        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
+        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
 
 
 def plot_var_runs(calendar: GroundTruthCalendar, keys: list[str], title: str = "VaR Forecast vs Loss") -> "go.Figure":
