@@ -4,7 +4,7 @@ import plotly.colors as pc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from core.var_level_and_volatility_utils import exceedance_day_details, exceedance_day_summary
+from core.var_level_and_volatility_utils import daily_tick_loss, exceedance_day_details, exceedance_day_summary
 
 
 def _var_hover_data(var_df, residualbank):
@@ -602,6 +602,42 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
     fig.update_annotations(font_size=12)              # the day titles
     fig.update_yaxes(tickformat='.1%', tickfont=dict(size=10))
     fig.update_xaxes(tickformat='%b %d', tickfont=dict(size=10))
+    return fig
+
+
+def plot_cumulative_tick_loss_difference(var_dfs, baseline, var_confidence,
+                                         title='Cumulative tick loss difference vs baseline'):
+    """
+    Where does each run gain or lose against a baseline run (e.g. a GARCH)? For every run the running sum of
+    (its daily tick loss - the baseline's daily tick loss): a line going DOWN means the run is better than the
+    baseline in that stretch, UP means worse. The baseline is the flat zero line.
+
+    var_dfs : dict[str, pd.DataFrame]
+        {run_name: var_df} on the same dates (as dm.compare_to_baseline takes them).
+    """
+    if baseline not in var_dfs:
+        raise KeyError(f"baseline {baseline!r} is not in var_dfs: {list(var_dfs)}")
+    base_tick = daily_tick_loss(var_dfs[baseline], var_confidence)
+
+    colors = pc.qualitative.Plotly
+    fig = go.Figure()
+    fig.add_hline(y=0, line_dash='dot', line_color='gray', annotation_text=f'baseline: {baseline}',
+                  annotation_position='top left')
+    for i, (name, var_df) in enumerate(var_dfs.items()):
+        if name == baseline:
+            continue
+        cumulative = (daily_tick_loss(var_df, var_confidence) - base_tick).cumsum()
+        fig.add_trace(go.Scatter(
+            x=cumulative.index, y=cumulative, mode='lines', name=name,
+            line=dict(color=colors[i % len(colors)], width=2),
+            hovertemplate='<b>%{x}</b><br>' + name + ': %{y:.4f}<extra></extra>',
+        ))
+
+    fig.update_layout(
+        title=title, xaxis_title='Date', yaxis_title='cumulative tick loss difference (below 0 = better than baseline)',
+        template='plotly_white', hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+    )
     return fig
 
 

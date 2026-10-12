@@ -24,6 +24,8 @@ from .var_level_and_volatility_utils import (
     exceedance_days_by_model,
     exceedance_day_details,
     exceedance_day_summary,
+    daily_tick_loss,
+    compare_to_baseline,
     level_and_volatility_forecast_period,
     level_and_volatility_train_period,
     level_and_volatility_entire_period,

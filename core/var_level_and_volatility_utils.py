@@ -173,6 +173,70 @@ def exceedance_day_summary(var_dfs: dict[str, pd.DataFrame], days) -> pd.DataFra
     return summary.loc[days.unique()]
 
 
+def daily_tick_loss(forecast_df: pd.DataFrame, var_confidence: float) -> pd.Series:
+    """
+    The tick (pinball) loss of every day (the mean of this series is run_level_and_volatility_suite_single_window's
+    mean_tick_loss): a * (loss - VaR) on an exceedance day, (1 - a) * (VaR - loss) otherwise, a = var_confidence.
+    """
+    if not 0 < var_confidence < 1:
+        raise ValueError(f"var_confidence must be in (0, 1), got {var_confidence!r}")
+    var = forecast_df[VAR_COL].astype(float)
+    u = forecast_df[LOSS_COL].astype(float) - var
+    return pd.Series(np.where(u > 0, var_confidence * u, -(1 - var_confidence) * u), index=forecast_df.index, name="tick_loss")
+
+
+def compare_to_baseline(
+    var_dfs: dict[str, pd.DataFrame], baseline: str, var_confidence: float, hac_lags: int = 5,
+) -> pd.DataFrame:
+    """
+    Every run against one baseline run (e.g. a GARCH), on the same days. One row per run, indexed by name.
+
+    var_dfs: {run_name: var_df} on the SAME dates and realized loss (checked, like exceedance_days_by_model).
+    Columns (difference = run - baseline, so NEGATIVE means the run is better than the baseline):
+        mean_tick_loss, tick_loss_diff, tick_loss_relative_diff (diff / baseline's mean tick loss),
+        days_better_share (share of days the run's tick loss is below the baseline's),
+        n_exceedances, exceedance_diff,
+        dm_t_stat, dm_p_value: Diebold-Mariano test, the mean of the daily tick-loss difference tested against 0
+            with a HAC (Newey-West, `hac_lags`) standard error, two-sided; NaN for the baseline itself.
+    A small p-value says the difference is not just day-to-day noise; it does not say the run is correct.
+    """
+    if baseline not in var_dfs:
+        raise KeyError(f"baseline {baseline!r} is not in var_dfs: {list(var_dfs)}")
+    base_df = var_dfs[baseline]
+    for name, var_df in var_dfs.items():
+        if not var_df.index.equals(base_df.index):
+            raise ValueError(f"var_dfs[{name!r}] is on different dates than the baseline {baseline!r}: use the same period.")
+        if (var_df[LOSS_COL].astype(float) - base_df[LOSS_COL].astype(float)).abs().max() > 1e-12:
+            raise ValueError(f"var_dfs[{name!r}] disagrees with the baseline on the realized loss.")
+
+    import statsmodels.api as sm
+
+    base_tick = daily_tick_loss(base_df, var_confidence)
+    base_exceed = int((base_df[LOSS_COL].astype(float) > base_df[VAR_COL].astype(float)).sum())
+    rows = {}
+    for name, var_df in var_dfs.items():
+        tick = daily_tick_loss(var_df, var_confidence)
+        diff = tick - base_tick
+        n_exceed = int((var_df[LOSS_COL].astype(float) > var_df[VAR_COL].astype(float)).sum())
+        row = {
+            "mean_tick_loss": float(tick.mean()),
+            "tick_loss_diff": float(diff.mean()),
+            "tick_loss_relative_diff": float(diff.mean() / base_tick.mean()),
+            "days_better_share": float((diff < 0).mean()),
+            "n_exceedances": n_exceed,
+            "exceedance_diff": n_exceed - base_exceed,
+            "dm_t_stat": np.nan,
+            "dm_p_value": np.nan,
+        }
+        if name == baseline:
+            row["days_better_share"] = np.nan
+        elif diff.abs().max() > 0:
+            fit = sm.OLS(diff.to_numpy(), np.ones(len(diff))).fit(cov_type="HAC", cov_kwds={"maxlags": hac_lags})
+            row["dm_t_stat"], row["dm_p_value"] = float(fit.tvalues[0]), float(fit.pvalues[0])
+        rows[name] = row
+    return pd.DataFrame(rows).T
+
+
 def _level_and_volatility_period(
     period_dates: pd.DatetimeIndex, var_df: pd.DataFrame, var_confidence: float, label: str,
 ) -> pd.Series:

@@ -18,6 +18,7 @@ from typing import Literal
 import pandas as pd
 
 import feature_builders as fb
+import garch_models as gm
 import tree_models as tm
 from core import (
     DEFAULT_EXPANDING_MIN_PERIODS,
@@ -99,7 +100,8 @@ class ModelRecipe:
     training time, so they live here and not in VarSetting.
     """
     model_format: Literal["long", "wide"]
-    model_kwargs: dict = field(default_factory=dict)
+    model_kwargs: dict = field(default_factory=dict)  # passed to xgboost, or to arch.arch_model for the garch family
+    model_family: Literal["xgboost", "garch"] = "xgboost"
     # features
     windows: tuple = (5, 10, 21)
     ewma_span: int = 21
@@ -116,6 +118,8 @@ class ModelRecipe:
     def __post_init__(self):
         if self.model_format not in ("long", "wide"):
             raise ValueError(f"model_format must be 'long' or 'wide', got {self.model_format!r}")
+        if self.model_family not in ("xgboost", "garch"):
+            raise ValueError(f"model_family must be 'xgboost' or 'garch', got {self.model_family!r}")
 
 
 @dataclass(frozen=True)
@@ -163,15 +167,16 @@ def train_walk_forward(
             default_mu_hat=recipe.default_mu_hat, mu_mode=recipe.mu_mode,
             rolling_mu_hat_window_size=recipe.rolling_mu_hat_window_size,
         )
+        train = tm.xgboost_train if recipe.model_family == "xgboost" else gm.garch_train
         if recipe.model_format == "long":
-            model = tm.xgboost_train(
+            model = train(
                 calendar, training_feature, residual_bank,
                 ewma_bank=EwmaVarianceBank(calendar, ewma_lam=recipe.ewma_lam, ewma_min_periods=recipe.ewma_min_periods),
                 **recipe.model_kwargs,
             )
             bank, ewma_bank = model.calculate_multi_day_standart_residuals_from_long_format_model(calendar, forecast_feature)
         else:
-            model = tm.xgboost_train(calendar, training_feature, residual_bank, **recipe.model_kwargs)
+            model = train(calendar, training_feature, residual_bank, **recipe.model_kwargs)
             bank = model.calculate_multi_day_standart_residuals_from_wide_format_model(calendar, forecast_feature)
             ewma_bank = None
 
