@@ -126,7 +126,8 @@ class TrainedGarchModel(TrainedModel):
 
 
 def _garch_train_wide(
-    training_feature: TrainingFeature, residual_bank: ResidualBank, arch_kwargs: dict, scale: float,
+    calendar: GroundTruthCalendar, training_feature: TrainingFeature, residual_bank: ResidualBank,
+    arch_kwargs: dict, scale: float,
 ) -> TrainedGarchModel:
     X = training_feature.X_in_sample
     train_returns = X["portfolio_return"].astype(float).sort_index()
@@ -136,8 +137,8 @@ def _garch_train_wide(
         training_feature, params, train_returns, arch_kwargs, scale, feature_cols=["portfolio_return"],
     )
 
-    # same bank filling as tree_models._tree_train_wide, only the variances come from GARCH: row f holds the
-    # variance forecast made from f for the bar after f, with the return that really followed
+    # same bank filling as tree_models._tree_train_wide, only the variances come from GARCH: the variance forecast
+    # made from feature date f is FOR the bar after f, so the row is labeled by that outcome bar (own-day rule)
     actual_next = training_feature.DANGEROUS_r_next_in_sample
     common_index = X.index.intersection(actual_next.index).intersection(training_feature.y_in_sample.index).sort_values()
     variance = _one_step_variance(train_returns, params, arch_kwargs, scale)
@@ -145,9 +146,10 @@ def _garch_train_wide(
         variance.loc[common_index].to_numpy(), dates=common_index, context="garch_train (wide)",
     )
 
-    residual_bank.start_training(common_index[0], training_feature.frequency)
+    outcome_dates = calendar.next_bars(common_index)
+    residual_bank.start_training(outcome_dates[0], training_feature.frequency)
     residual_bank.training_safe_bulk_insert(
-        dates=common_index,
+        dates=outcome_dates,
         actual_returns=actual_next.loc[common_index].to_numpy(),
         predicted_variances=predicted_variances,
     )
@@ -199,4 +201,4 @@ def garch_train(
         return _garch_train_long(calendar, training_feature, residual_bank, ewma_bank, arch_kwargs, scale)
     if ewma_bank is not None:
         raise ValueError("ewma_bank is only used by the long-format path.")
-    return _garch_train_wide(training_feature, residual_bank, arch_kwargs, scale)
+    return _garch_train_wide(calendar, training_feature, residual_bank, arch_kwargs, scale)

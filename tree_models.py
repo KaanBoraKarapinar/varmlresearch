@@ -67,7 +67,8 @@ def _tree_train_long(
 
 
 def _tree_train_wide(
-    training_feature: TrainingFeature, model_constructor, model_name: str, model_kwargs: dict, residual_bank: ResidualBank,
+    calendar: GroundTruthCalendar, training_feature: TrainingFeature, model_constructor, model_name: str,
+    model_kwargs: dict, residual_bank: ResidualBank,
 ) -> TrainedTreeModel:
     feature_cols = training_feature.feature_cols
     actual_next = training_feature.DANGEROUS_r_next_in_sample
@@ -88,9 +89,12 @@ def _tree_train_wide(
     # TrainedModel.long_format_calculate_training_standartized_residuals for the full explanation). training_safe_bulk_insert ramps the
     # stateful mu_hat up from scratch instead.
     # residual_bank is SINGLE-USE: bound to this run and filled in place, see TrainedModel.long_format_calculate_training_standartized_residuals
-    residual_bank.start_training(common_index[0], training_feature.frequency)
+    # own-day rule: the variance forecast made from feature date f is FOR the bar after f, and so is the return in
+    # actual_next, so the row is labeled by that outcome bar (same as the long path and the forecast phase)
+    outcome_dates = calendar.next_bars(common_index)
+    residual_bank.start_training(outcome_dates[0], training_feature.frequency)
     residual_bank.training_safe_bulk_insert(
-        dates=common_index,
+        dates=outcome_dates,
         actual_returns=actual_next.loc[common_index].to_numpy(),
         predicted_variances=predicted_variances,
     )
@@ -124,7 +128,7 @@ def tree_train(
         return _tree_train_long(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank, ewma_bank)
     if ewma_bank is not None:
         raise ValueError("ewma_bank is only used by the long-format path.")
-    return _tree_train_wide(training_feature, model_constructor, model_name, model_kwargs, residual_bank)
+    return _tree_train_wide(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank)
 
 
 def xgboost_train(
