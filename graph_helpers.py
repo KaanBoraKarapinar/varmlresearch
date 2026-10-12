@@ -4,6 +4,9 @@ import plotly.colors as pc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from core.var_level_and_volatility_utils import exceedance_day_details, exceedance_day_summary
+
+
 def _var_hover_data(var_df, residualbank):
     """var_df + the bank's predicted_variance / predicted_sigma / mu_hat / standardized_residual per date; returns (merged, hover_cols, hovertemplate)."""
     resid_df = residualbank.to_dataframe()
@@ -41,10 +44,77 @@ def _add_train_forecast_bands(fig, calendar, dates, **vrect_kwargs):
                           line_width=0, annotation_text=label, annotation_position='top left', **vrect_kwargs)
 
 
-def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss', calendar=None):
+def _add_time_navigation(fig, dates):
+    """
+    Go to any time on the date axis: a range slider under the graph (drag or resize the window), quick-range
+    buttons (1w / 1m / 3m / 6m / all) and a "go to month" dropdown. The y axis re-fits the visible window.
+    """
+    dates = pd.DatetimeIndex(dates)
+    months = pd.period_range(dates.min(), dates.max(), freq='M')
+    month_buttons = [dict(label='Go to month: all', method='relayout', args=[{'xaxis.autorange': True}])] + [
+        dict(
+            label=str(month), method='relayout',
+            args=[{'xaxis.range': [month.start_time.strftime('%Y-%m-%d'), month.end_time.strftime('%Y-%m-%d')]}],
+        )
+        for month in months
+    ]
+
+    fig.update_xaxes(
+        rangeslider=dict(visible=True, thickness=0.07),
+        rangeselector=dict(
+            x=0, y=1.14, xanchor='left', yanchor='bottom',
+            buttons=[
+                dict(count=7, label='1w', step='day', stepmode='backward'),
+                dict(count=1, label='1m', step='month', stepmode='backward'),
+                dict(count=3, label='3m', step='month', stepmode='backward'),
+                dict(count=6, label='6m', step='month', stepmode='backward'),
+                dict(step='all', label='all'),
+            ],
+        ),
+    )
+    fig.update_layout(
+        updatemenus=[dict(
+            type='dropdown', buttons=month_buttons, showactive=True,
+            x=0.42, y=1.14, xanchor='left', yanchor='bottom',
+        )],
+        margin=dict(t=150),
+    )
+
+
+def _add_exceedance_markers(fig, merged):
+    """
+    Highlights the days with loss > varForecast (VaR exceedances) on the realized-loss line: a red ring plus the
+    running number 1, 2, 3, ... in date order, so the count in the legend and the numbers on the graph agree.
+    """
+    exceeded = merged[merged['loss'] > merged['varForecast']]
+    if exceeded.empty:
+        return
+    numbers = np.arange(1, len(exceeded) + 1)
+
+    fig.add_trace(go.Scatter(
+        x=exceeded.index,
+        y=exceeded['loss'],
+        mode='markers+text',
+        text=numbers.astype(str),
+        textposition='top center',
+        textfont=dict(color='crimson', size=12),
+        name=f'Exceedance (loss > VaR): {len(exceeded)}',
+        marker=dict(symbol='circle-open', size=13, color='crimson', line=dict(width=2)),
+        customdata=np.column_stack([numbers, exceeded['varForecast'].to_numpy(dtype=float)]),
+        hovertemplate=(
+            '<b>%{x}</b><br>Exceedance #%{customdata[0]}<br>'
+            'Realized Loss: %{y:.2%}<br>VaR Forecast: %{customdata[1]:.2%}<extra></extra>'
+        ),
+    ))
+
+
+def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss', calendar=None, mark_exceedances=True,
+                     time_navigation=True):
     """
     VaR Forecast ve Realized Loss'u plotly ile çizer.
     Hover'da predicted_variance (model_output), predicted_sigma, mu_hat ve standardized_residual gösterilir.
+    mark_exceedances=True ise loss > varForecast olan günler kırmızı halkayla vurgulanır ve tarih sırasına göre
+    numaralanır (1, 2, 3, ...); legend'da toplam sayı yazar.
 
     Parameters
     ----------
@@ -57,6 +127,10 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
         Grafik başlığı.
     calendar : GroundTruthCalendar, optional
         Verilirse train ve forecast dönemleri arka plan bandı olarak (mavi / turuncu) gösterilir.
+    mark_exceedances : bool
+        loss > varForecast günlerini vurgula ve numarala.
+    time_navigation : bool
+        True ise istedigin zamana gitmek icin range slider, 1w/1m/3m/6m/all butonlari ve "ay sec" dropdown'i eklenir.
 
     Returns
     -------
@@ -86,6 +160,9 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
         hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:.2%}<extra></extra>'
     ))
 
+    if mark_exceedances:
+        _add_exceedance_markers(fig, merged)
+
     if calendar is not None:
         _add_train_forecast_bands(fig, calendar, merged.index)
 
@@ -98,6 +175,9 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         yaxis_tickformat='.1%'
     )
+
+    if time_navigation:
+        _add_time_navigation(fig, merged.index)
 
     return fig
 
@@ -161,7 +241,7 @@ def plot_var_with_window_size(var_df, residualbank, title='VaR Forecast vs Reali
     return fig
 
 
-def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)', calendar=None):
+def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)', calendar=None, time_navigation=True):
     """
     plot_var_vs_loss for several models of the SAME calendar: one VaR line per model on top of the one
     realized-loss line. Hover per model shows its predicted_variance (model_output), mu_hat, standardized
@@ -175,6 +255,8 @@ def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)'
     title : str
     calendar : GroundTruthCalendar, optional
         Verilirse train ve forecast dönemleri arka plan bandı olarak (mavi / turuncu) gösterilir.
+    time_navigation : bool
+        True ise range slider, 1w/1m/3m/6m/all butonlari ve "ay sec" dropdown'i eklenir.
 
     Returns
     -------
@@ -224,6 +306,10 @@ def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)'
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         yaxis_tickformat='.1%'
     )
+
+    if time_navigation:
+        _add_time_navigation(fig, loss.index)
+
     return fig
 
 
@@ -299,6 +385,288 @@ def plot_models_output_vs_realized_variance(calendar, residualbanks, ewma_lam=0.
 def plot_model_output_vs_realized_variance(calendar, residualbank, model_name='model', **kwargs):
     """Single-model plot_models_output_vs_realized_variance (same parameters, see there)."""
     return plot_models_output_vs_realized_variance(calendar, {model_name: residualbank}, **kwargs)
+
+
+def _windowed_figure(fig, dates, start_date, window_bars):
+    """
+    A copy of `fig` showing `window_bars` bars from `start_date` (None = until the last date). The start is the
+    first bar on/after start_date (clamped to the data); the y axis is fitted to the points inside the window.
+    """
+    dates = pd.DatetimeIndex(dates)
+    start_pos = min(int(dates.searchsorted(pd.Timestamp(start_date))), len(dates) - 1)
+    end_pos = len(dates) - 1 if window_bars is None else min(start_pos + window_bars - 1, len(dates) - 1)
+    start, end = dates[start_pos], dates[end_pos]
+
+    windowed = go.Figure(fig)
+    windowed.update_xaxes(range=[start - pd.Timedelta(days=1), end + pd.Timedelta(days=1)])
+
+    lows, highs = [], []
+    for trace in windowed.data:
+        if getattr(trace, 'x', None) is None or getattr(trace, 'y', None) is None:
+            continue
+        x = pd.DatetimeIndex(trace.x)
+        y = np.asarray(trace.y, dtype=float)
+        inside = (x >= start) & (x <= end) & ~np.isnan(y)
+        if inside.any():
+            lows.append(y[inside].min())
+            highs.append(y[inside].max())
+    if lows:
+        low, high = min(lows), max(highs)
+        pad = (high - low) * 0.12 or 0.001
+        windowed.update_yaxes(range=[low - pad, high + pad])
+    return windowed
+
+
+def _date_picker_view(fig, dates, window_options):
+    """Date picker + window length dropdown above `fig`; every change re-draws the figure (ipywidgets)."""
+    try:
+        import ipywidgets as widgets
+    except ImportError as exc:
+        raise ImportError("The date picker needs ipywidgets: pip install ipywidgets") from exc
+
+    dates = pd.DatetimeIndex(dates)
+    picker = widgets.DatePicker(
+        description='Start date', value=dates[0].date(), min=dates[0].date(), max=dates[-1].date(),
+    )
+    window = widgets.Dropdown(description='Window', options=window_options, value=None)
+    out = widgets.Output()
+
+    def redraw(*_):
+        start_date = picker.value if picker.value is not None else dates[0].date()
+        with out:
+            out.clear_output(wait=True)
+            _windowed_figure(fig, dates, start_date, window.value).show()
+
+    picker.observe(redraw, names='value')
+    window.observe(redraw, names='value')
+    redraw()
+    return widgets.VBox([widgets.HBox([picker, window]), out])
+
+
+_DATE_PICKER_WINDOWS = [
+    ('all bars', None), ('1 week (5 bars)', 5), ('1 month (21 bars)', 21),
+    ('3 months (63 bars)', 63), ('6 months (126 bars)', 126),
+]
+
+
+def var_vs_loss_date_picker(var_df, residualbank, title='VaR Forecast vs Realized Loss', calendar=None,
+                            mark_exceedances=True, window_options=_DATE_PICKER_WINDOWS):
+    """
+    plot_var_vs_loss with a DatePicker: pick a start date and a window length, the graph jumps there
+    (needs ipywidgets; display the returned widget as the last expression of a cell).
+    """
+    fig = plot_var_vs_loss(var_df, residualbank, title=title, calendar=calendar,
+                           mark_exceedances=mark_exceedances, time_navigation=False)
+    return _date_picker_view(fig, var_df.index, window_options)
+
+
+def var_models_vs_loss_date_picker(runs, title='VaR Forecast vs Realized Loss (models)', calendar=None,
+                                   window_options=_DATE_PICKER_WINDOWS):
+    """plot_var_models_vs_loss with a DatePicker and a window length dropdown (see var_vs_loss_date_picker)."""
+    fig = plot_var_models_vs_loss(runs, title=title, calendar=calendar, time_navigation=False)
+    first_var_df = next(iter(runs.values()))[0]
+    return _date_picker_view(fig, first_var_df.index, window_options)
+
+
+def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
+    """
+    ONE figure with the given days stacked one under another. Per day a row with
+      - a graph (left): the VaR line of every model and the realized loss for `window_bars` bars around the day,
+        the day marked with a dotted line, the days some model missed ringed with the number of models that
+        missed them;
+      - a table (right): per model the loss, the VaR, the difference loss - VaR and whether the VaR was
+        exceeded (exceeded rows tinted red).
+    The same numbers as a plain table: dm.exceedance_day_details(var_dfs, days).
+
+    Parameters
+    ----------
+    var_dfs : dict[str, pd.DataFrame]
+        {model_name: var_df} of the SAME period (same dates and realized loss).
+    days : pd.DataFrame | pd.DatetimeIndex | list
+        The days to focus on, e.g. the dm.exceedance_days_by_model(...) table (its index is used).
+    window_bars : int
+        Bars shown on each side of the day.
+    row_height : int
+        Pixels per day. The figure is `row_height * number of days` tall: pass fewer days to get a shorter one.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
+    if not var_dfs:
+        raise ValueError("var_dfs is empty.")
+    if isinstance(days, pd.DataFrame):
+        days = days.index
+    days = pd.DatetimeIndex(days)
+
+    names = list(var_dfs)
+    dates = var_dfs[names[0]].index
+    for name, var_df in var_dfs.items():
+        if not var_df.index.equals(dates):
+            raise ValueError(f"var_dfs[{name!r}] is on different dates than var_dfs[{names[0]!r}].")
+    missing = days.difference(dates)
+    if len(missing):
+        raise KeyError(f"days not in var_dfs: {[d.date().isoformat() for d in missing]}")
+
+    colors = pc.qualitative.Plotly
+    n_days = len(days)
+    losses = var_dfs[names[0]]['loss'].astype(float)
+
+    # every number shown below is computed by the helpers (core.var_level_and_volatility_utils), not here
+    summary = exceedance_day_summary(var_dfs, days)                       # per day, across the models
+    details = exceedance_day_details(var_dfs, days, labels=False)         # per (day, model)
+
+    # one title per grid cell, row-major: (graph, table) for every day; the table cell has no title
+    titles = []
+    for day in days:
+        s = summary.loc[day]
+        titles += [
+            f"<b>{day.date()}</b>  |  loss {s['loss']:.2%}  |  missed by {int(s['n_missed'])} of {int(s['n_models'])} models<br>"
+            f"diff (loss - VaR): avg {s['avg_difference']:+.2%}  |  min {s['min_difference']:+.2%}  |  max {s['max_difference']:+.2%}",
+            '',
+        ]
+
+    height = row_height * n_days + 190
+    # ~70 px between two days (room for the day title); the rest of the row is the graph / table
+    vertical_spacing = min(70 / (height - 270), 0.9 / max(n_days - 1, 1))
+
+    fig = make_subplots(
+        rows=n_days, cols=2, column_widths=[0.58, 0.42],
+        specs=[[{'type': 'xy'}, {'type': 'table'}]] * n_days,
+        subplot_titles=titles,
+        vertical_spacing=vertical_spacing, horizontal_spacing=0.03,
+    )
+
+    day_tables = []
+    for row, day in enumerate(days, start=1):
+        pos = dates.get_loc(day)
+        window = dates[max(pos - window_bars, 0): pos + window_bars + 1]
+        first = row == 1
+
+        # graph: every model's VaR line and the one realized loss line
+        for i, name in enumerate(names):
+            part = var_dfs[name].loc[window]
+            fig.add_trace(go.Scatter(
+                x=part.index, y=part['varForecast'], mode='lines', name=name, legendgroup=name, showlegend=first,
+                line=dict(color=colors[i % len(colors)], width=2),
+                hovertemplate=f'<b>%{{x}}</b><br>{name} VaR: %{{y:.2%}}<extra></extra>',
+            ), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=window, y=losses.loc[window], mode='lines+markers', name='Realized Loss', legendgroup='loss',
+            showlegend=first, line=dict(color='black', width=2), marker=dict(size=5),
+            hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:.2%}<extra></extra>',
+        ), row=row, col=1)
+
+        # the days in the window that at least one model missed, ringed, with the number of models that missed them
+        window_summary = exceedance_day_summary(var_dfs, window)
+        missed_by = window_summary['n_missed'][window_summary['n_missed'] > 0]
+        if len(missed_by):
+            fig.add_trace(go.Scatter(
+                x=missed_by.index, y=window_summary.loc[missed_by.index, 'loss'], mode='markers+text',
+                text=missed_by.astype(str),
+                textposition='top center', textfont=dict(color='crimson', size=10),
+                marker=dict(symbol='circle-open', size=11, color='crimson', line=dict(width=2)),
+                name='Missed (n = models)', legendgroup='missed', showlegend=first,
+                hovertemplate='<b>%{x}</b><br>missed by %{text} models<extra></extra>',
+            ), row=row, col=1)
+        fig.add_vline(x=day, line_dash='dot', line_color='gray', row=row, col=1)
+
+        # table: per model the loss, the VaR and the difference on the day (exceeded rows tinted red)
+        rows = details.loc[day]                                           # one row per model, in `names` order
+        tint = ['mistyrose' if hit else 'white' for hit in rows['exceeded']]
+        ink = ['crimson' if hit else 'black' for hit in rows['exceeded']]
+        # (added after the loop: add_vline cannot look at a figure that already holds Table traces)
+        day_tables.append((row, go.Table(
+            columnwidth=[1.0, 0.8, 0.8, 0.9, 1.5],
+            header=dict(values=['model', 'loss', 'VaR', 'diff', 'status'],
+                        fill_color='lightgray', align='left', font=dict(size=10), height=22),
+            cells=dict(
+                values=[list(rows.index), [f'{v:.2%}' for v in rows['loss']], [f'{v:.2%}' for v in rows['var_forecast']],
+                        [f'{v:+.2%}' for v in rows['difference']],
+                        ['exceeded' if hit else 'not exceeded' for hit in rows['exceeded']]],
+                fill_color=[tint] * 5, font=dict(color=[ink] * 5, size=10), align='left', height=22,
+            ),
+        )))
+
+    for row, table in day_tables:
+        fig.add_trace(table, row=row, col=2)
+
+    # paper coordinates are fractions of the plot area: pixel offsets are converted with the figure height
+    fig.update_layout(
+        title=dict(text=f'Exceedance days, +/- {window_bars} bars around each day (all models)',
+                   x=0, xanchor='left', y=1 - 18 / height, yanchor='top', font=dict(size=16)),
+        template='plotly_white', height=height, margin=dict(t=170, b=80),
+        legend=dict(orientation='h', yanchor='bottom', y=1.0 + 45 / (height - 250), xanchor='left', x=0,
+                    font=dict(size=11)),
+    )
+    fig.update_annotations(font_size=12)              # the day titles
+    fig.update_yaxes(tickformat='.1%', tickfont=dict(size=10))
+    fig.update_xaxes(tickformat='%b %d', tickfont=dict(size=10))
+    return fig
+
+
+def plot_level_and_volatility(level_volatility, title='VaR level and volatility by run'):
+    """
+    Small-multiples view of the level-and-volatility table (columns = runs, rows = result fields, as built from
+    dm.level_and_volatility_forecast_period): every measure on its own axis, runs side by side.
+    Bar colour: blue = a run name ending in '_long', orange = '_wide' (anything else grey).
+
+    Panels: tick loss (stacked: VaR too high + VaR too low, total = mean_tick_loss), conservativeness
+    (VaR / realized quantile, 1 = the window's own quantile), coverage (exceedance rate vs expected),
+    VaR volatility (coefficient of variation), jumpiness (mean |daily change| / mean VaR), tail severity.
+    """
+    m = level_volatility.astype(float)
+    runs = list(m.columns)
+    colors = {'long': '#1f77b4', 'wide': '#ff7f0e'}
+    bar_colors = [colors.get(run.rsplit('_', 1)[-1], 'gray') for run in runs]
+
+    fig = make_subplots(
+        rows=2, cols=3, vertical_spacing=0.22, horizontal_spacing=0.07,
+        subplot_titles=(
+            'Mean tick loss (x 1e-4): lower is better',
+            'Conservativeness: mean VaR / realized quantile',
+            'Exceedance rate (dashed = expected)',
+            'VaR volatility: std / mean',
+            'VaR jumpiness: mean |daily change| / mean VaR',
+            'Tail severity: mean size of exceedances',
+        ),
+    )
+
+    # tick loss: the two parts stacked (overlay + base), the total on top is mean_tick_loss
+    overshoot = m.loc['tick_loss_overshoot_part'] * 1e4
+    exceedance = m.loc['tick_loss_exceedance_part'] * 1e4
+    fig.add_trace(go.Bar(
+        x=runs, y=overshoot, name='VaR too high (overshoot)', marker_color='lightgray',
+        hovertemplate='%{x}<br>overshoot part: %{y:.2f}<extra></extra>',
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=runs, y=exceedance, base=overshoot, name='VaR too low (exceedances)', marker_color='crimson',
+        text=[f'{t:.2f}' for t in overshoot + exceedance], textposition='outside',
+        hovertemplate='%{x}<br>exceedance part: %{y:.2f}<extra></extra>',
+    ), row=1, col=1)
+
+    single_panels = (
+        ('var_to_realized_quantile_ratio', 1, 2, '%{y:.2f}', 1.0),
+        ('exceedance_rate', 1, 3, '%{y:.1%}', float(m.loc['expected_exceedance_rate'].iloc[0])),
+        ('var_cv', 2, 1, '%{y:.2f}', None),
+        ('relative_mean_abs_daily_change', 2, 2, '%{y:.2f}', None),
+        ('mean_exceedance_size', 2, 3, '%{y:.2%}', None),
+    )
+    for field, row, col, fmt, reference in single_panels:
+        fig.add_trace(go.Bar(
+            x=runs, y=m.loc[field], marker_color=bar_colors, showlegend=False,
+            texttemplate=fmt, textposition='outside',
+            hovertemplate='%{x}<br>' + field + ': ' + fmt + '<extra></extra>',
+        ), row=row, col=col)
+        if reference is not None:
+            fig.add_hline(y=reference, line_dash='dash', line_color='black', row=row, col=col)
+
+    fig.update_layout(
+        title=title, template='plotly_white', barmode='overlay', height=720,
+        legend=dict(orientation='h', yanchor='bottom', y=1.08, xanchor='left', x=0),
+    )
+    fig.update_yaxes(rangemode='tozero')
+    return fig
 
 
 def plot_ewma_bank(ewma_bank, split_date=None, heatmap_date=None, as_volatility=False,

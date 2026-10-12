@@ -63,32 +63,25 @@ Bank'larda (`ResidualBank`, `EwmaVarianceBank`) bir satırın tarihi **outcome g
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
 | calendar.train_data                                           | verilen train_start ile train_end arasindaki data                                                                                                                                          |                 |
 | calendar.forecast_data                                        | verilen forecast_start ile forecast end arasindaki data<br><br>(ForecastFeaturenin aksine training döneminin son out of sample verisini tasimaz! Sadece forecast doneminin datasini tasir) |                 |
-| calendar.self.DANGEROUS_<br>merged_warmedup_<br>FORECAST_data | Train Data+ Forecast Data<br><br>DANGEROUS<br><br>-> ForecastFeature uretilirken Kullanilir<br>-> Ewma bank uretilirken kullanilir<br>                                                     |                 |
-| calendar. train_data_with_warmup                              | warmup periyodunu da kapsayan veri                                                                                                                                                         |                 |
+| calendar. train_data_with_warmup                              | warmup periyodunu da kapsayan veri<br>Warmup + Train Data, warmup periyodu varsa <br>TrainingFeature ve                                                                                    |                 |
+| calendar.self.DANGEROUS_<br>merged_warmedup_<br>FORECAST_data | Warmup Data + Train Data+ Forecast Data<br><br>DANGEROUS<br><br>-> ForecastFeature uretilirken Kullanilir<br><br>                                                                          |                 |
+
+
 
 # Fonksiyonlar
 
-| Fonksiyon |     |     |
-| --------- | --- | --- |
-|           |     |     |
-|           |     |     |
-|           |     |     |
-|           |     |     |
+###### `var_from_residual_bank_X_period`, 
+* Calendar icindeki train, forecast, veya train + forecast bütün periyot icin  VaR hesaplamasi yapar
+
+###### `ewma_realized_variance_bank`
+(self, ewma_lam: float = 0.94, ewma_min_periods: int = 30)
+* MODEL VARIANCE TAHMINLERI ILE DEGIL, GERCEK RETURN DEGERLERININ RETURN UZERINDEN HESAPLANMIS KOVARYANS/VARYANS DEGERLERI HESAPLAMA YAPAR
+  
+* Detaylar
+* EWMA bank olusturur, calendardaki warmup durumuna göre warmup verisi ile veya training verisi ile seed eder (ilk kovaryans matrixini olusturur)
+* Sonra geri kalan dönem icin EWMA methodunu olusturur
 
 
-
-
-
-|     |     |     |
-| --- | --- | --- |
-|     |     |     |
-|     |     |     |
-|     |     |     |
-|     |     |     |
-
-# TrainingFeature
-
-# ForecastFeature
 
 
 
@@ -96,13 +89,8 @@ Bank'larda (`ResidualBank`, `EwmaVarianceBank`) bir satırın tarihi **outcome g
 
 
 
-| `calendar.forecast_pairs()` in dondurdugu  `outcome_dates`    | `feature_dates[i]`'nin hemen **sonraki** barı. Tahminin ait olduğu gün, VaR'ın çıktığı gün |     |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | --- |
-| `calendar.usable_train_dates` in dondurduguu u `usable_dates` | `feature_dates` içinde EWMA burn-in'ini de geçenler                                        |     |
-|                                                               |                                                                                            |     |
-|                                                               |                                                                                            |     |
-|                                                               |                                                                                            |     |
-|                                                               |                                                                                            |     |
+
+
 
 # Residual Bank
 ![[02_residual_bank.drawio.svg]]
@@ -348,6 +336,11 @@ general_bulk_insert(...)                                  96 eğitim satırı + 
 ###### `_portfolio_variance_from_cov(cov, sigma_diag, weights)`
 * bir günun varyansindan (modelin hesapladigi) por
 
+###### `EWMABANK.general_bulk_insert()`
+* Parametre olarak diagonal verileri alabilir ya da almadan kendi hesaplayarak ilerleyebilir 
+
+
+
 # Training
 
 ## Trained Model Abstract Class
@@ -545,6 +538,71 @@ forecast_end="2024-12-31",
 | --------------- | -------------------------------------------------------------------------- | ----------------------------------- |
 | `feature_dates` | `train_end` + bütün forecast günleri (`= calendar.forecast_feature_dates`) | 22 tarih: `2024-11-29 → 2024-12-31` |
 | `start`, `end`  | `feature_dates`'in ilk ve son tarihi (`calendar.forecast_start` **değil**) | `2024-11-29`, `2024-12-31`          |
+|                 |                                                                            |                                     |
 
 
 
+
+# Backtest Suite
+
+
+
+## Statistical Tests
+
+| Test                                    | Neyi sorar                                                            | İstatistik                                                                | Çıktı alanı                          |
+| --------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------ |
+| **Binomial**                            | İhlal sayısı beklenenle uyuşuyor mu                                   | z = (X − Np)/√(Np(1−p)), \|z\| > 1.96 ise red (normal yaklaşım)           | `binomial_pass`                      |
+| **Basel traffic light**                 | İhlal sayısı Basel'in yeşil/sarı/kırmızı bölgelerinden hangisinde     | P(Binom(N,p) ≤ X) < 0.95 yeşil (1), < 0.9999 sarı (2), diğeri kırmızı (3) | `traffic_light_zone`                 |
+| **Kupiec POF**                          | İhlal _oranı_ p'ye eşit mi (unconditional coverage)                   | olabilirlik oranı, χ²(1)                                                  | `kupiec_pof_stat`, `kupiec_pof_pass` |
+| **Kupiec TUFF**                         | İlk ihlale kadar geçen süre makul mü                                  | ilk ihlal gününe göre LR, χ²(1)                                           | `kupiec_tuff_pass`                   |
+| **Haas TBF**                            | İhlaller arasındaki tüm bekleme süreleri makul mü (oran + aralık)     | LR_TBFI + LR_POF, χ²(X+1)                                                 | `haas_tbf_pass`                      |
+| **Christoffersen independence**         | İhlaller kümeleniyor mu (dün ihlal → bugün ihlal olasılığı farklı mı) | 1. derece Markov zinciri LR, χ²(1)                                        | `christoffersen_ind_stat/_pass`      |
+| **Christoffersen conditional coverage** | Oran **ve** bağımsızlık birlikte                                      | LR_POF + LR_IND, χ²(2)                                                    | `christoffersen_cc_stat/_pass`       |
+
+
+###### `run_full_backtest_suite_single_window(forecast_df, ...)`
+forecast_df: `varForecast` ve `loss` kolonlu, tarih indeksli tek bir `forecast_df` .
+start_date,
+end_date,
+var_confidence: float : hesapladigimiz varin confidence seviyesi
+test_confidence: float : Backtest'in ne kadar kesinlikle karar vereceği
+
+* 
+
+##### Exceedance/ iIhlal:
+`loss > varForecast` olan gün (kesin büyük).
+
+##### P = 1 - var_confidence
+(VaR %95 ise p = 0.05). Doğru bir VaR'da ihlal olasılığı p olmalı. 
+
+##### test confidence:
+`alpha = 1 - test_confidence`,
+**0.95 → 0.99**: Test daha zor red verir. Doğru bir modeli yanlışlıkla reddetme riski %5'ten %1'e düşer.
+
+
+
+
+### 21 günlük bir periyotu test etmek ile 252 günlük bir periyodu test etmek arasindaki fark
+
+21 günlük bir model icerisinde, %95 VaR da exceedancelerin olma ihtimali (binom dagilim ile, birbirinden bagimsiz günler)
+
+
+
+### Model Based Tests
+
+| Group            | Metric (result key)                                                       | Meaning                                                                                     |
+| ---------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Score            | `mean_tick_loss`                                                          | headline, lower is better                                                                   |
+|                  | `tick_loss_exceedance_part`                                               | mean of `a*(L-V)+`: cost of being too LOW (tail days)                                       |
+|                  | `tick_loss_overshoot_part`                                                | mean of `(1-a)*(V-L)+`: cost of being too HIGH (conservatism)                               |
+| Conservativeness | `mean_var`, `median_var`                                                  | raw VaR level                                                                               |
+|                  | `var_to_realized_quantile_ratio`                                          | `mean_var / empirical a-quantile of L in the window` (>1 = conservative)                    |
+|                  | `mean_slack_non_exceedance`                                               | mean of `V - L` on non-exceedance days (unused buffer)                                      |
+| Tail severity    | `mean_exceedance_size`, `max_exceedance_size`                             | how bad the misses are (`L - V` on exceedance days)                                         |
+| Volatility       | `var_std`, `var_cv` (std/mean)                                            | scale-free spread of the VaR                                                                |
+|                  | `mean_abs_daily_change`, `relative_mean_abs_daily_change` (/ mean VaR)    | day-to-day jumpiness                                                                        |
+|                  | `var_p95_p5_ratio`, `var_max_min_ratio`                                   | range                                                                                       |
+| Context          | `exceedance_rate`, `expected_exceedance_rate`, `n_days`, `var_confidence` | conservatism must be read together with coverage (VaR = 100% is "conservative" and useless) |
+
+
+# Walk Forward Experiment

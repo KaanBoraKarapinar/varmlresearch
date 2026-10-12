@@ -1,13 +1,20 @@
 """
-VaR backtest suite -- copied from 08_backtest_trafficlight_kupiec_christoffersen.ipynb,
-logic unchanged.
+Statistical VaR backtest suite (hypothesis tests: binomial, Basel traffic light, Kupiec POF/TUFF, Haas TBF,
+Christoffersen) -- copied from 08_backtest_trafficlight_kupiec_christoffersen.ipynb, logic unchanged.
+The descriptive side (how high / how volatile the VaR is, tick loss) lives in var_level_and_volatility_utils.py.
 """
 
 from __future__ import annotations
 
+import warnings
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+
+if TYPE_CHECKING:
+    from .GroundTruthCalendar import GroundTruthCalendar
 
 VAR_COL = "varForecast"
 LOSS_COL = "loss"
@@ -324,6 +331,8 @@ def run_full_backtest_suite_single_window(
     n = preprocess["N_window_size_by_weekdays_in_df"]
 
     out = {
+        "var_confidence": var_confidence,
+        "test_confidence": test_confidence,
         "n_days": n,
         "n_exceedances": x,
         "exceedance_rate": x / n if n > 0 else np.nan,
@@ -339,6 +348,7 @@ def run_full_backtest_suite_single_window(
         detailed_output=True,
     )
     out["kupiec_pof_stat"] = kupiec["test_statistic"]
+    out["kupiec_pof_critical_value"] = kupiec["threshold"]    # the stat must stay at or below this to pass
     out["kupiec_pof_pass"] = not kupiec["reject_h0"]
 
     if x > 0:
@@ -355,6 +365,7 @@ def run_full_backtest_suite_single_window(
         detailed_output=True,
     )
     out["christoffersen_ind_stat"] = christ_ind["test_statistic"]
+    out["christoffersen_ind_critical_value"] = christ_ind["threshold"]
     out["christoffersen_ind_pass"] = not christ_ind["reject_h0"]
 
     christ_cc = christoffersen_conditional_coverage_single_window(
@@ -362,9 +373,106 @@ def run_full_backtest_suite_single_window(
         detailed_output=True,
     )
     out["christoffersen_cc_stat"] = christ_cc["test_statistic"]
+    out["christoffersen_cc_critical_value"] = christ_cc["threshold"]
     out["christoffersen_cc_pass"] = not christ_cc["reject_h0"]
 
     return out
+
+
+def _period_var_df(
+    period_dates: pd.DatetimeIndex, var_df: pd.DataFrame, label: str, caller: str,
+) -> pd.DataFrame:
+    """
+    The varForecast/loss rows of var_df on the calendar's `period_dates` (shared by every per-period suite, e.g.
+    level_and_volatility_*_period). Only the calendar's date index is used (the losses come from var_df);
+    warns if var_df does not cover all of the period's dates. `caller` is only used in the messages.
+    """
+    dates = period_dates[period_dates.isin(var_df.index)]
+    if len(dates) != len(period_dates):
+        warnings.warn(
+            f"{caller}: var_df covers {len(dates)} of the {len(period_dates)} {label}-period "
+            f"calendar dates; it runs on those {len(dates)}.", stacklevel=4,
+        )
+    if dates.empty:
+        raise ValueError(f"{caller}: var_df has none of the {label}-period calendar dates.")
+
+    # sequence-dependent measures (TUFF, Haas, Christoffersen, daily VaR change) read neighbouring rows as
+    # consecutive bars: no bar may be missing
+    if (np.diff(period_dates.get_indexer(dates)) != 1).any():
+        raise ValueError(f"{caller}: the {label}-period dates in var_df are not consecutive bars of the calendar.")
+
+    forecast_df = var_df.loc[dates, [VAR_COL, LOSS_COL]]
+    if forecast_df.isna().any().any():
+        raise ValueError(f"{caller}: var_df has NaN in {VAR_COL}/{LOSS_COL} in the {label} period.")
+    return forecast_df
+
+
+def _backtest_period(
+    period_dates: pd.DatetimeIndex, var_df: pd.DataFrame, var_confidence: float, test_confidence: float, label: str,
+) -> pd.Series:
+    """The rows of var_df on the calendar's `period_dates` (see _period_var_df), backtested as ONE window."""
+    forecast_df = _period_var_df(period_dates, var_df, label, caller=f"backtest_{label}_period")
+    result = run_full_backtest_suite_single_window(
+        forecast_df, forecast_df.index[0], forecast_df.index[-1], var_confidence, test_confidence)
+    return pd.Series(result, name=label)
+
+
+def backtest_forecast_period(
+    calendar: "GroundTruthCalendar", var_df: pd.DataFrame, var_confidence: float, test_confidence: float = 0.95,
+) -> pd.Series:
+    """
+    run_full_backtest_suite_single_window on the FORECAST dates of var_df: the out-of-sample, honest test.
+    var_df: 'varForecast' + 'loss' columns, date index (calendar.var_from_residual_bank_*_period output).
+    var_confidence must be the one var_df was produced with (it is not stored in var_df); both confidences are
+    embedded in the result. Returns a Series named "forecast" (one column when put into a DataFrame).
+    """
+    return _backtest_period(calendar.forecast_dates, var_df, var_confidence, test_confidence, "forecast")
+
+
+def backtest_train_period(
+    calendar: "GroundTruthCalendar", var_df: pd.DataFrame, var_confidence: float, test_confidence: float = 0.95,
+) -> pd.Series:
+    """
+    Same on the TRAIN dates of var_df (in-sample). Optimistic by construction (the model saw these targets):
+    a sanity check / overfitting gauge, not performance evidence. Series named "train".
+    """
+    return _backtest_period(calendar.train_data.index, var_df, var_confidence, test_confidence, "train")
+
+
+def backtest_entire_period(
+    calendar: "GroundTruthCalendar", var_df: pd.DataFrame, var_confidence: float, test_confidence: float = 0.95,
+) -> pd.Series:
+    """
+    Same on every train + forecast date of var_df, as ONE window (the in-sample part makes it optimistic, see
+    backtest_train_period). Series named "entire".
+    """
+    period_dates = calendar.train_data.index.append(calendar.forecast_dates)
+    return _backtest_period(period_dates, var_df, var_confidence, test_confidence, "entire")
+
+
+def backtest_periods_side_by_side(
+    calendar: "GroundTruthCalendar",
+    var_confidence: float,
+    test_confidence: float = 0.95,
+    *,
+    forecast_var_df: pd.DataFrame | None = None,
+    train_var_df: pd.DataFrame | None = None,
+    entire_var_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    backtest_forecast_period / backtest_train_period / backtest_entire_period for the var_dfs you pass, as
+    one table: one column per period ("forecast", "train", "entire"), one row per result field.
+    """
+    columns = []
+    if forecast_var_df is not None:
+        columns.append(backtest_forecast_period(calendar, forecast_var_df, var_confidence, test_confidence))
+    if train_var_df is not None:
+        columns.append(backtest_train_period(calendar, train_var_df, var_confidence, test_confidence))
+    if entire_var_df is not None:
+        columns.append(backtest_entire_period(calendar, entire_var_df, var_confidence, test_confidence))
+    if not columns:
+        raise ValueError("Pass at least one of forecast_var_df, train_var_df, entire_var_df.")
+    return pd.concat(columns, axis=1)
 
 
 def _pass_rate(flags: pd.Series) -> float:

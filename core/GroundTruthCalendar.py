@@ -4,8 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from var_backtest_utils import run_full_backtest_suite_single_window
-
+from .statistical_var_backtest_utils import run_full_backtest_suite_single_window
 from .EwmaVarianceBank import EwmaVarianceBank
 
 if TYPE_CHECKING:
