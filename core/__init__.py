@@ -11,6 +11,10 @@ from .GroundTruthCalendar import (
 from .ResidualBank import ResidualBank, RESIDUAL_COLS, VARIANCE_FLOOR, DEFAULT_EXPANDING_MIN_PERIODS
 from .EwmaVarianceBank import EwmaVarianceBank
 from .TrainedModel import TrainedModel
+# AbsReturn exists as a target and as a feature block: the blocks live in core.feature_blocks
+from .targets import Target, SquaredReturn, RatioToBase, LogVariance, AbsReturn
+from .feature_blocks import FeatureSpec
+from .feature_builders import build_features, build_long_features, build_wide_features
 from .statistical_var_backtest_utils import (
     run_full_backtest_suite_single_window,
     run_full_backtest_suite_all_windows,

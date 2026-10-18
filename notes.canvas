@@ -36,8 +36,12 @@
 		{"id":"b75906a02a0cfc04","type":"text","text":"# Optiver ile autotest edilebilecek / runlastirilabilecek seyler\n---\n\n* var hesaplama periyodu kac gune baksin\n* egitimin nereye kadar gittigi\n*  \\\n* ","x":3116,"y":1827,"width":724,"height":313},
 		{"id":"4c0a97e0a26c3c33","type":"text","text":"# oto test akisi\n---\n\n# 1) bigtest mantigi\n-> bu degisitirlebilir parcalari modeli retrain etmeden\n( kac günle var hesaplayacagiz, residuallari devredecek miyiz falan ) oto hesaplayip parquet olarak kaydetmek\n\nya da sadece pre hesaplanmislari kaydetmek\n\n# 2) api + powerbi","x":3900,"y":1827,"width":789,"height":533},
 		{"id":"c5d4f3e10979bc1e","type":"text","text":"# Walk Forward\nsorumluluklari iyi paylastirmamissin sadece WalkForwardSetting 1) calendar setting 2) residual paylasimi hakkindaki kararlari alan bir yapi olustur ve calendar üretsin sonra o calendarlari teslim alan ve model teslim alip train eden bir yapi olustur sonra o modellerden forecast period, train period, tüm period icin icin VaR aldigi setting ile olusturan yapi olustur. sonra residual paylasimi ahkkindaki karara bagli olarak final var df döndüren bir fonksiyon yaz. atladigim bir kisim var mi?","x":4740,"y":1667,"width":764,"height":693},
-		{"id":"d9bad9ce3875a353","x":5664,"y":1787,"width":736,"height":773,"type":"text","text":"# Garch Akisi\n---\n![[Pasted image 20261012075130.png]]"},
-		{"id":"4a7160a2f956058b","x":6514,"y":2108,"width":686,"height":332,"type":"text","text":"![[Pasted image 20261012080025.png]]"}
+		{"id":"d9bad9ce3875a353","type":"text","text":"# Garch Akisi\n---\n![[Pasted image 20261012075130.png]]","x":5664,"y":1787,"width":736,"height":773},
+		{"id":"4a7160a2f956058b","type":"text","text":"![[Pasted image 20261012080025.png]]","x":6514,"y":2108,"width":686,"height":332},
+		{"id":"38c7e4ff5e638362","type":"text","text":"# ne kadar veri gördugu ve bayatlik\n\n![[Pasted image 20261012081918.png]]![[Pasted image 20261012082415.png]]","x":5689,"y":2682,"width":911,"height":558},
+		{"id":"e0a9f89cc449dea7","type":"text","text":"# cozum icin ticker identity vermenin alternatifi\n---\n![[Pasted image 20261012082906.png]]","x":6349,"y":3384,"width":851,"height":976},
+		{"id":"1210b5cdfc8fd084","type":"text","text":"# GARCHIN YAPTIGI GIBI TEK SEFERDE 30 GUNLUK TAHMIN YAPMAK XGBOOST ILE\n\n# XGBOOST EPOCHLARINI DENEMEK.\n","x":2760,"y":3080,"width":755,"height":434},
+		{"id":"3e1b3f77ff8a4142","x":3386,"y":3711,"width":639,"height":369,"type":"text","text":"![[Pasted image 20261018102013.png]]"}
 	],
 	"edges":[
 		{"id":"e32de0cc2ceef388","fromNode":"7532a339ed4b27e7","fromSide":"bottom","toNode":"3ee38b16b0bb7232","toSide":"top"},
@@ -54,6 +58,8 @@
 		{"id":"7c8647da751d6402","fromNode":"47af39a2dc337b06","fromSide":"bottom","toNode":"398fc881cc20a98e","toSide":"top"},
 		{"id":"3ea9acc5d6818e90","fromNode":"47af39a2dc337b06","fromSide":"bottom","toNode":"2e4503c4cb5ebedb","toSide":"top"},
 		{"id":"ab1bdd6f45b484ad","fromNode":"398fc881cc20a98e","fromSide":"bottom","toNode":"568994517b8c3318","toSide":"top"},
-		{"id":"c72d554436f8e0b5","fromNode":"b75906a02a0cfc04","fromSide":"top","toNode":"4c0a97e0a26c3c33","toSide":"top"}
+		{"id":"c72d554436f8e0b5","fromNode":"b75906a02a0cfc04","fromSide":"top","toNode":"4c0a97e0a26c3c33","toSide":"top"},
+		{"id":"df687a9070f3e4b6","fromNode":"d9bad9ce3875a353","fromSide":"bottom","toNode":"38c7e4ff5e638362","toSide":"top"},
+		{"id":"23db298b10f46bdc","fromNode":"38c7e4ff5e638362","fromSide":"bottom","toNode":"e0a9f89cc449dea7","toSide":"top"}
 	]
 }

@@ -447,9 +447,7 @@ ewma_bank: EwmaVarianceBank,
 # Feature Generation
 
 
-````python
-training_feature_long, forecast_feature_long = fb.build_long_fetures(calendar, target_scale=1e4)
-````
+
 
 ## Generation Esnasindaki Parameterler
 | Parametre             | Etki                                                                                             |
@@ -497,12 +495,14 @@ training_feature_long, forecast_feature_long = fb.build_long_fetures(calendar, t
 
 
 
-| `TrainingFeature`            | Anlam                                                                             |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| `X_in_sample`, `y_in_sample` | Hedefi bilinen satırlar ve ölçeklenmiş hedefleri                                  |
-| `X_out_sample_last_index`    | Son train günü, hedefi yok                                                        |
-| `X_in_sample_id_cols`        | Satır başına `Date`, `ticker` (sadece long formatta)                              |
-| `DANGEROUS_r_next_in_sample` | Ertesi gün gerçek getiri (**!!!ölçeksiz, karesiz!!!**), sadece değerlendirme için |
+| `TrainingFeature`            | Anlam                                                                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `X_in_sample`, `y_in_sample` | Hedefi bilinen satırlar ve ölçeklenmiş hedefleri                                                                        |
+| `X_out_sample_last_index`    | Son train günü, hedefi yok                                                                                              |
+| `X_in_sample_id_cols`        | Satır başına `Date`, `ticker` (sadece long formatta)                                                                    |
+| `DANGEROUS_r_next_in_sample` | Ertesi gün gerçek getiri (**!!!ölçeksiz, karesiz!!!**), sadece değerlendirme için                                       |
+| base_variance                | Eger base variancea ihtiyac duyan bir target varsa, varyans tahmini icin gerekli base variance.<br><br>y olusturulurken |
+|                              |                                                                                                                         |
 
 ### Training Feature ve Forecast Feature icerisindeki tarih Noktalari
 
@@ -540,8 +540,204 @@ forecast_end="2024-12-31",
 | `start`, `end`  | `feature_dates`'in ilk ve son tarihi (`calendar.forecast_start` **değil**) | `2024-11-29`, `2024-12-31`          |
 |                 |                                                                            |                                     |
 
+---
+
+# Featurebuilders, Targets ve Feature Blocks Mantigi
+
+# Feature Builders
 
 
+# Targets
+* Modelin ile train edildigi ve sonra üretilen ciktinin nasil varianceye dönüstügünü tanimlayan bir class.
+* Bunu icerisinde veri tutarak degil, **matematiksel formül tutarak yapiyor.**
+
+
+## Veri Noktalari
+
+* target.scale : targetin büyütüldügü scale
+* target.base_lam :
+* target.needs_base : base lam dolu ise, 
+
+
+##### ` target.forward_make_y(self, r_next, base_variance=None) -> np.ndarray:`
+* icerisinde bir sonraki günün r_nexti verildiginde bunu modelin ögrenecegi sayiya y ye cevirir.
+	* Örnek: `SquaredReturn` → `r² × scale`
+	* base variance mantiginde calisanlarda:
+	* `RatioToBase` → `r² / base_variance`).
+	* 
+
+##### ` target.inverse_to_variance(self, prediction, base_variance=None) -> np.ndarray:`
+* `forward`'ın tersi: iceri parametre ile verilen modelin tahminini gerçek varyans birimine geri çeviriyor.
+	* `SquaredReturn` → prediction / scale`
+	*  base variance mantiginde calisanlarda:
+	* `RatioToBase` → `tahmin × base_variance`.
+
+
+## Base Variance / Olcek Normalizasyonu Mantigi
+
+* Olcek normalizasyonu iceren, **gerçek varyansın EWMA varyansının kaç katı olduğunu (m)** ögrenen bir model yazmak icin kullanilir.
+
+Getirinin ortalaması $\approx 0$ ise, $r_{f+1}^2$ gerçek varyansın gürültülü bir gözlemidir:
+
+$$  
+r_{f+1} = \sigma_{f+1}\, z, \qquad z \sim (0,1)  
+\;\Longrightarrow\;  
+\mathbb{E}\!\left[r_{f+1}^2\right] = \sigma_{f+1}^2  
+$$
+Hedefi
+
+$$y_f = \frac{r_{f+1}^2}{\hat{\sigma}^2_{f+1,\,\mathrm{base}}}$$
+
+olarak tanımladığımızda, baz varyans $f$ anında bilindiği için beklentinin dışına çıkar:
+
+$$  
+\mathbb{E}\!\left[y_f \mid \mathcal{F}_f\right]  
+= \frac{\mathbb{E}\!\left[r_{f+1}^2 \mid \mathcal{F}_f\right]}{\hat{\sigma}^2_{f+1,\,\mathrm{base}}}  
+= \frac{\sigma_{f+1}^2}{\hat{\sigma}^2_{f+1,\,\mathrm{base}}}  
+= m_f  
+$$
+
+Yani model, gerçek varyansın EWMA varyansının kaç katı olduğunu ($m_f$) öğrenir. $m_f = 1$ ise EWMA zaten doğrudur.
+
+
+
+##### `emwa_base_variance(self, returns: pd.DataFrame, min_periods: int = 30) -> pd.DataFrame | None:`
+
+* Ewma bank mantigini kopyalar.
+* `min_periods=min_periods`: İlk 30 satır NaN kalır, yani ısınma (warmup) süresi. A
+* iceri verilen returns icin,  **target mantigi ile** ile bir variance tahmin proxysi olusturur.
+	* **BUNUN YUZUNDEN BASELI OLANLARDA KOPYALANIP** `(returns ** 2)` kismi targete göre uyarlanarak tekrar yazilmali.
+* `base_lam` λ lambda agirligi ile bir EWMA mantigi ile güncellenmis GUNLUK EVMA varianceleri olusturur.
+  
+
+
+
+
+## Su an tanimli olan targetler
+| Hedef           | Modelin öğrendiği `y`                   | Varyans (geri dönüşüm)             | Ek alanlar                                                                                                                                                                                          | Taban (EWMA) gerekir mi |
+| --------------- | --------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `SquaredReturn` | `r² × scale`                            | `tahmin / scale`                   | yok                                                                                                                                                                                                 | hayır                   |
+| `RatioToBase`   | `min(r² / EWMA varyansı, clip) × scale` | `(tahmin / scale) × EWMA varyansı` | `base_lam=0.94`, `min_periods=30`, `clip=None`<br><br><br>clip= asiri volatil günlerde,<br>![[Pasted image 20261015230246.png]]<br>egitimin görecegi max sayiyi belirli bir degerde sinirlamak icin | **evet**                |
+| `LogVariance`   | `log(r² + eps) × scale`                 | `exp(tahmin / scale)`              | `eps=1e-8`                                                                                                                                                                                          | hayır                   |
+| `AbsReturn`     | `                                       | r                                  | × scale`                                                                                                                                                                                            | `(tahmin / scale)²`     |
+|                 |                                         |                                    |                                                                                                                                                                                                     |                         |
+|                 |                                         |                                    |                                                                                                                                                                                                     |                         |
+
+
+
+# Feature Blocks / Feature Spec / Feature Builders
+
+### Feature Blocks:
+
+
+* FeatureBlock classi
+	*  Tek bir **feature sütununun** matematiksel olarak tanimini icerir
+	* Her blok bir `compute(returns, tickers)` metoduna sahip ve `(özellik_adı, değerler)` seklinde outputa sahip
+	* Bütün bloklar aynı girdiyi alıyor: tarih × dönus tablosu (`returns`). 
+		* ![[Pasted image 20261015231342.png]]
+	* `long_only = True` oalrak isaretlenirse, ozellik sadece long icin mantikli vr wide icerisinde atlanir
+
+
+
+### FeatureSpec:
+
+##### 1. `blocks: tuple`
+
+Tek alan: blokların sıralı listesi. Örneğin:
+
+```python
+FeatureSpec((Returns(), AbsReturn(), RollingStats((5, 21)), EwmaVol(21)))
+```
+
+##### 2. `default(...)`: hazır varsayılan liste
+Ilk denemelerimden kalan feature seti, `[Returns(), AbsReturn(), RollingStats(tuple(windows)), EwmaVol(ewma_span)` ile olusturuluyor
+
+##### 3. `withblocks(...)`: onceden hazirlanmis bir FeatureSpecin uzerine yeni bir ekleme yapma
+
+##### 4. `compute(returns, tickers)`: asıl iş
+Değerleri `kind`'a göre `series` veya `shared` sözlüğüne koyuyor, yanına `views`'i (wide/long) ekliyor.
+
+
+# fb.build_features
+* Iceri verilen Feature Tanimi, Target Tanimi, Calendar ve arzulanan tipe göre (long yada wide) Feature özelliklerini üretir fb.build_feauters 
+
+```python
+spec = FeatureSpec((
+    Returns(),
+    AbsReturn(),
+    RollingVol((5, 21)),         # sadece volatilite, iki pencere
+    EwmaVol(21),
+    EwmaVariance(0.94),          # EWMA varyansı feature olarak
+    TickerOneHot(),              # ticker kimliği (sadece long'da)
+))
+
+target = RatioToBase(clip=20)
+
+
+training_feature, forecast_feature = fb.build_features(
+    calendar, "long", spec,target,
+)
+```
+
+
+### Akisa Dair Detay
+* calendar.DANGEROUS_merged_warmedup_FORECAST_data'i, warmup + train + forecast birleşik tabloyu alir.
+* her spec icin iceri return degerlerini ve ticker adlarini vererek ciktiyi alir.
+* **r_next**i olusturur, returns.shift(-1) ile.
+* 
+
+# Tree Models
+
+# Garch Models
+
+* Garch(1,1) calistirir,
+$$
+σ²_{t+1} = ω + α · r_t² + β · σ²_t
+$$
+
+- `r_t²`: dünkü getirinin karesi (dün büyük hareket olduysa yarın da oynak olma eğilimi var, volatilite kümelenmesi).
+- `σ²_t`: dünkü varyans tahmini (varyans yavaş değişir).
+- `ω, α, β`: üç parametre, eğitim verisinden **maximum likelihood** ile bulunur.
+
+
+* ## Temel baselinemiz, wide garch. sadece portfolyonun getirilerine bakarak tahmin yapar.
+
+
+
+### helper methods
+
+##### `_fit_params`
+iceri veirlen return ve scale degeri ile garch fit eder, `result.params` döndürur
+
+##### `_one_step_variance`
+returns: pd.Series: tahmin yapilacak günlerin return degerleri
+params: pd.Series : fit esnasinda buldugumuz arch parametreleri, train verisi ile hesalanmis
+
+cikti: returns icindeki her gün icin variance tahmini
+
+* .fix(params) ile bulunan parametreler ile sabit bir model olusturuyoruz
+* fixed.forecast(horizon=1, start=0, reindex=False) sayesinde, `start=0` bu hesabın serinin başından itibaren **her gün için** üretilmesini sağlıyor. 
+
+##### `check_chronological_order_and_combine_dataframes
+#possiblebug
+* verilen train feature ve forecast featurenin icerisindeki return degerlerini birlestirir
+* **Tahmin yapilirken, GARCHIN train zamanindaki degerleri de görerek ilerlemesi gerekir. Aslinda expanding bir mantik** 
+
+
+## Wide Training/ Prediction
+* Training periyottaki **PORTFOLYO RETURNU** ile modeli train eder.
+* Tahmin zamaninda da yine Portfolyo Returnlarini ve fit edilmis   _one_step_variance ile iceri verip tahminleri alir.
+
+## Long  Training and Predicion
+* Her bir ticker icin ayrica egitir.
+	* Olusan parametreleri `TrainedGarchModel.params[ticker]` altinda saklar.
+* Ewma Residual Bank ile varianceleri Tree Modelde oldugu gibi birlestirir ve portfolio varianceini hesaplar.
+
+
+
+* Prediction esnasinda
+
+---
 
 # Backtest Suite
 
@@ -605,4 +801,116 @@ test_confidence: float : Backtest'in ne kadar kesinlikle karar vereceği
 | Context          | `exceedance_rate`, `expected_exceedance_rate`, `n_days`, `var_confidence` | conservatism must be read together with coverage (VaR = 100% is "conservative" and useless) |
 
 
+# Baseline = Garch Model
+
+
+
 # Walk Forward Experiment
+
+```python
+
+setting = wf.WalkForwardSetting(
+    train_bars=756,        # 3 yıl train
+    forecast_bars=252,     # her model 252 gün tahmin eder, sonra pencere 252 bar ilerler
+    expanding=False,       # False: kayan pencere (hep 756 bar); True: baştan büyüyen
+    warmup_bars=30,        # train başından önceki ısınma barları (sadece rolling/EWMA ısınması)
+)
+calendars = setting.make_calendars(df, TICKERS, WEIGHTS)     # her pencere için bir takvim
+
+
+recipe = wf.ModelRecipe(
+    'long',                                   # 'long' | 'wide'
+    model_family='xgboost',                   # 'xgboost' | 'garch' | 'ewma' (modelsiz)
+    target=SquaredReturn(scale=10000),        # ne tahmin edilir (RatioToBase, LogVariance, AbsReturn da var)
+    features=FeatureSpec.default(),           # hangi feature'lar
+    model_kwargs=dict(n_estimators=100, max_depth=3),   # xgboost'a gider (garch'ta arch_model'e)
+    mu_mode='constant', default_mu_hat=0.0,   # residual bank ayarı (eğitimde residual'lara gömülür)
+    ewma_lam=0.94, ewma_min_periods=30,       # EWMA korelasyon bank'ı (sadece long)
+)
+
+fits = wf.train_walk_forward(calendars, recipe)    # her pencere için bir WalkForwardSingleCalendarFit
+
+
+var_df = wf.create_combined_residuals_bank_and_read_var_df(
+    fits,                                          # birleşik residual bank'ı içeride kurar ve VaR'ı ondan okur
+    var_confidence=0.95,                           # alt %5 quantile
+    multi_day_var_calculation_window_size=252,     # int: son N residual; None: eldeki tüm residual'lar (expanding)
+    multi_day_var_min_periods=30,                  # bir günün VaR alması için gereken en az önceki residual
+)
+# var_df sütunları: varForecast, n_residuals_used, loss, window_id
+
+bank = wf.build_combined_residual_bank_WITHOUT_CALC(fits)    # aynı birleşik bank, VaR hesaplamadan (grafikler için)
+
+
+
+
+
+```
+
+
+* Elimizdeki veri icin birden fazla calendar olusturarak, elimizdeki veriyi bircok pencereye cevirip ayni modeli farkli zaman dilimleri icin egitip, total olarak bütün periyotlar icerisinde ne kadar basarili oldugumuzu incelemek icin bir sistem.
+
+* ##### forecast edilen günler atlanmadan, kendileri  bir sonraki periyodun tahminine eklenir
+* ##### Tek bir experiment sonunda tek bir VaR Dataframei olusturulur.
+
+
+- 
+
+## Class: WalkForwardSetting
+```
+train_bars: int
+forecast_bars: int = 21
+expanding: bool = False
+warmup_bars: int = 30
+residual_sharing: Literal["none", "carry_over"] = "none"
+```
+
+* train_bars = kac günlük/ barlik veri ile tahmin edecegiz?
+* forecast_bars = kac günü tahmin edecegiz
+* warmup_bars = normal calendarda oldugu gibi, train verisi icerisinde direkt olmayan ama train verisi icerisindeki gecmise yonelik verileri egitmek icin kac gun geriye bakabileceginin ayari
+
+* **expanding** = train dönemi gittikce uzamali mi mi (önerilmez) yoksa sadece bu train bars kadarki periyot icerisinde mi kalmali
+
+
+
+### `def WalkForwardSetting.make_calendars(df, TICKERS, WEIGHTS)
+* Ayarlar tanimlandiktan sonra onlara göre verilen dataframe uzerinden **calendarlari** olusturup döndürür.
+* 
+
+# Model Ayarlama, Featureleri Verme ve Train Etme
+### Class: ModelRecipe
+* **`model_family`:** `'xgboost'`, `'garch'` (arch paketi, sadece getirileri okur) veya `'ewma'` (modelsiz saf EWMA, "hiçbir şey yapmama" tabanı).
+- **`model_format`:** `'long'` veya `'wide'`.
+- **`features` ve `target`:** hangi feature blokları, ne tahmin edilecek (`core/feature_blocks.py`, `core/targets.py`).
+- **Bank ayarları:** `mu_mode`, `default_mu_hat`, `ewma_lam`, `ewma_min_periods`. Bunlar eğitim sırasında residual'lara gömüldüğü için burada.
+-
+```python
+
+recipe_garch = wf.ModelRecipe('wide', model_family='garch',
+                              model_kwargs=dict(mean='Zero', vol='GARCH', p=1, q=1, dist='normal'))
+recipe_ewma  = wf.ModelRecipe('wide', model_family='ewma')                      # saf EWMA tabanı
+recipe_ratio = wf.ModelRecipe('long', target=RatioToBase(clip=20),
+                              features=FeatureSpec.default().with_blocks(TickerOneHot()))
+```
+###  `train_walk_forward(calendars, recipe)`
+Olusturulan calendarlar ile modelleri üretir backtesting icin.
+
+### WalkForwardSingleCalendarFit
+
+* Her bir egitilmis calendar döneminin egitilmis modelini, residual bankini, ve  ewma bankini tasir.
+* window_id: alir egitim surecindeki sirasina göre.
+* 
+
+# Var ve Residual Bank Olusturma
+
+
+#### `build_combined_residual_bank_WITHOUT_CALC`
+* fitlerin residual banklarina erisir ve sadece forecast kisimlarinin alip birlestirir
+* ilk fitin training lossunu da iceri verilen tüm tarih icin residual olusturabilmek adina en basa ekler.
+* 
+
+#### `create_combined_residuals_bank_and_read_var_df`
+* 
+
+
+

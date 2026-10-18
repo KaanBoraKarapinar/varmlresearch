@@ -5,27 +5,29 @@ Dataclasses only hold decisions or results, plain functions do the work:
 
     WalkForwardSetting.make_calendars(...)   calendar decisions  -> list of calendars
     train_walk_forward(calendars, recipe)    calendars + recipe  -> list of WalkForwardSingleCalendarFit
-    share_residuals(fits, residual_sharing)  residual decision   -> list of fits (banks possibly shared)
-    var_by_period(fit, var_setting)          one fit             -> forecast / train / entire VaR
-    build_var_df(fits, var_setting, ...)     everything          -> the stitched forecast var_df
+    build_combined_residual_bank_WITHOUT_CALC(fits)   all windows -> ONE combined ResidualBank (no VaR)
+    create_combined_residuals_bank_and_read_var_df(fits, var_confidence, window, ...)
+                                             fits + any reading -> the VaR of every forecast day
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Literal
 
 import pandas as pd
 
-import feature_builders as fb
 import garch_models as gm
 import tree_models as tm
 from core import (
-    DEFAULT_EXPANDING_MIN_PERIODS,
     DailyGroundTruthCalendar,
     EwmaVarianceBank,
+    FeatureSpec,
     ResidualBank,
+    SquaredReturn,
+    Target,
     TrainedModel,
+    build_features,
 )
 
 
@@ -36,30 +38,22 @@ from core import (
 @dataclass(frozen=True)
 class WalkForwardSetting:
     """
-    Calendar decisions and the residual-sharing decision.
+    Calendar decisions.
 
     Windows advance by forecast_bars, so the forecast windows tile the data with no gap and no overlap
     (that is what lets them be stitched into one series). Each forecast window becomes part of the
     train window of the next steps: rolling keeps train_bars bars, expanding keeps everything since the start.
-
-    residual_sharing:
-        'none'       every window's VaR quantile reads its own model's residuals (in-sample ones for the train dates)
-        'carry_over' for a date that was a forecast day of an earlier window, the earlier model's out-of-sample
-                     residual replaces the new model's (optimistic, in-sample) one
     """
     train_bars: int
     forecast_bars: int = 21
     expanding: bool = False
     warmup_bars: int = 30
-    residual_sharing: Literal["none", "carry_over"] = "none"
 
     def __post_init__(self):
         if self.train_bars <= 0 or self.forecast_bars <= 0:
             raise ValueError("train_bars and forecast_bars must be positive.")
         if self.warmup_bars < 0:
             raise ValueError("warmup_bars must be non-negative.")
-        if self.residual_sharing not in ("none", "carry_over"):
-            raise ValueError(f"residual_sharing must be 'none' or 'carry_over', got {self.residual_sharing!r}")
 
     def make_calendars(
         self, tickers_raw_price_data: pd.DataFrame, tickers: list[str], weights: dict[str, float] | pd.Series,
@@ -97,16 +91,18 @@ class WalkForwardSetting:
 class ModelRecipe:
     """
     How every window's model is trained. The two bank groups are baked into the stored residuals at
-    training time, so they live here and not in VarSetting.
+    training time, so they live here and not in the VaR reading (create_combined_residuals_bank_and_read_var_df).
+
+    model_family: 'xgboost' (features + target below), 'garch' (arch package, reads only the returns) or
+    'ewma' (no model at all: the pure RiskMetrics EWMA variance, the "do nothing" baseline; model_format,
+    features, target and model_kwargs are ignored).
     """
     model_format: Literal["long", "wide"]
     model_kwargs: dict = field(default_factory=dict)  # passed to xgboost, or to arch.arch_model for the garch family
-    model_family: Literal["xgboost", "garch"] = "xgboost"
-    # features
-    windows: tuple = (5, 10, 21)
-    ewma_span: int = 21
-    sq_return_lags: tuple | None = None
-    target_scale: float = 1.0
+    model_family: Literal["xgboost", "garch", "ewma"] = "xgboost"
+    # what the model sees and what it is trained to predict (core/feature_blocks.py / core/targets.py)
+    features: FeatureSpec = field(default_factory=FeatureSpec.default)
+    target: Target = SquaredReturn(1.0)
     # ResidualBank
     mu_mode: Literal["rolling", "constant"] = "constant"
     default_mu_hat: float = 0.0
@@ -118,20 +114,8 @@ class ModelRecipe:
     def __post_init__(self):
         if self.model_format not in ("long", "wide"):
             raise ValueError(f"model_format must be 'long' or 'wide', got {self.model_format!r}")
-        if self.model_family not in ("xgboost", "garch"):
-            raise ValueError(f"model_family must be 'xgboost' or 'garch', got {self.model_family!r}")
-
-
-@dataclass(frozen=True)
-class VarSetting:
-    """
-    How the VaR is read off a residual bank (see ResidualBank.multi_day_var). window None = expanding.
-    min_periods = fewest prior residuals a day needs to get a VaR; 30 (like the single-calendar notebooks) so a
-    train of exactly `window` bars still works. None would mean "the window must be full".
-    """
-    var_confidence: float
-    window: int | None
-    min_periods: int | None = DEFAULT_EXPANDING_MIN_PERIODS
+        if self.model_family not in ("xgboost", "garch", "ewma"):
+            raise ValueError(f"model_family must be 'xgboost', 'garch' or 'ewma', got {self.model_family!r}")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -146,7 +130,7 @@ class WalkForwardSingleCalendarFit:
     """
     window_id: int
     calendar: DailyGroundTruthCalendar
-    trained_model: TrainedModel
+    trained_model: TrainedModel | None  # None for the 'ewma' family (no model)
     residual_bank: ResidualBank
     ewma_bank: EwmaVarianceBank | None = None  # long format only
 
@@ -155,14 +139,12 @@ def train_walk_forward(
     calendars: list[DailyGroundTruthCalendar], recipe: ModelRecipe,
 ) -> list[WalkForwardSingleCalendarFit]:
     """One model per calendar (fresh single-use banks every time). No VaR and no residual sharing here."""
-    build_features = fb.build_long_features if recipe.model_format == "long" else fb.build_wide_features
-
     fits = []
     for window_id, calendar in enumerate(calendars):
-        training_feature, forecast_feature = build_features(
-            calendar, windows=recipe.windows, ewma_span=recipe.ewma_span,
-            sq_return_lags=recipe.sq_return_lags, target_scale=recipe.target_scale,
-        )
+        if recipe.model_family == "ewma":
+            fits.append(_ewma_fit(window_id, calendar, recipe))
+            continue
+        training_feature, forecast_feature = build_features(calendar, recipe.model_format, recipe.features, recipe.target)
         residual_bank = ResidualBank(
             default_mu_hat=recipe.default_mu_hat, mu_mode=recipe.mu_mode,
             rolling_mu_hat_window_size=recipe.rolling_mu_hat_window_size,
@@ -184,75 +166,40 @@ def train_walk_forward(
     return fits
 
 
-# --------------------------------------------------------------------------------------------------
-# VaR
-# --------------------------------------------------------------------------------------------------
+def _ewma_fit(window_id: int, calendar: DailyGroundTruthCalendar, recipe: ModelRecipe) -> WalkForwardSingleCalendarFit:
+    """
+    The no-model baseline: the portfolio variance is the pure EWMA w' Sigma w of the realized returns (each
+    date's value is built from strictly earlier returns), standardized and read exactly like a model's.
+    Nothing is fitted, so train and forecast residuals are equally honest.
+    """
+    ewma_bank = calendar.ewma_realized_variance_bank(recipe.ewma_lam, recipe.ewma_min_periods)
+    variance = ewma_bank.portfolio_variance
+    dates = variance.index[variance.index.isin(calendar.train_data.index.append(calendar.forecast_dates))]
+    returns = calendar.DANGEROUS_merged_warmedup_FORECAST_data["portfolio_return"].loc[dates]
 
-def var_by_period(fit: WalkForwardSingleCalendarFit, var_setting: VarSetting) -> dict[str, pd.DataFrame]:
-    """
-    One fit's VaR for its forecast, train and entire period, all with the same VaR setting, read off
-    fit.residual_bank only (no cross-window logic here, see share_residuals). Keys: forecast / train / entire.
-    The first min_periods bank dates of train / entire carry no VaR (not enough prior residuals).
-    """
-    _, min_periods = ResidualBank._resolve_quantile_window(var_setting.window, var_setting.min_periods)
-    calendar, bank = fit.calendar, fit.residual_bank
-    return {
-        "forecast": calendar.var_from_residual_bank_forecast_period(
-            bank, var_setting.var_confidence, var_setting.window, f"walk_forward_{fit.window_id}", min_periods,
-        ),
-        "train": calendar.var_from_residual_bank_train_period(
-            bank, var_setting.var_confidence, var_setting.window, min_periods,
-        ),
-        "entire": calendar.var_from_residual_bank_entire_period(
-            bank, var_setting.var_confidence, var_setting.window, min_periods,
-        ),
-    }
+    residual_bank = ResidualBank(
+        default_mu_hat=recipe.default_mu_hat, mu_mode=recipe.mu_mode,
+        rolling_mu_hat_window_size=recipe.rolling_mu_hat_window_size,
+    )
+    residual_bank.start_training(dates[0], calendar.frequency)
+    residual_bank.training_safe_bulk_insert(dates, returns.to_numpy(), variance.loc[dates].to_numpy())
+    return WalkForwardSingleCalendarFit(window_id, calendar, None, residual_bank, ewma_bank)
 
 
 # --------------------------------------------------------------------------------------------------
-# residual sharing + the final var_df
+# one residual bank for the whole walk-forward, read with any VaR reading
 # --------------------------------------------------------------------------------------------------
 
-def share_residuals(
-    fits: list[WalkForwardSingleCalendarFit], residual_sharing: Literal["none", "carry_over"],
-) -> list[WalkForwardSingleCalendarFit]:
+def build_combined_residual_bank_WITHOUT_CALC(fits: list[WalkForwardSingleCalendarFit]) -> ResidualBank:
     """
-    'none': the fits unchanged.
-    'carry_over': in time order, every date of a fit's bank that was a FORECAST day of an earlier window
-    gets the earlier model's out-of-sample row (all columns) instead of the new model's in-sample row. The
-    first window has no earlier model, so it is unchanged. Returns new fits; the given ones are not modified.
-    """
-    if residual_sharing == "none":
-        return list(fits)
-    if residual_sharing != "carry_over":
-        raise ValueError(f"residual_sharing must be 'none' or 'carry_over', got {residual_sharing!r}")
+    ONE ResidualBank for the whole walk-forward, in time order: the first window's bank as it is (its in-sample
+    train residuals, then its out-of-sample forecast ones, the usual single-calendar start so the quantile
+    window is full from the first day), followed by only the out-of-sample (forecast-date) rows of every later
+    window. Once the window has moved past the first train, every residual it reads is out-of-sample.
 
-    out_of_sample_rows = pd.DataFrame()
-    shared = []
-    for fit in fits:
-        bank = fit.residual_bank.copy()
-        if len(out_of_sample_rows):
-            overlap = bank.residuals.index.intersection(out_of_sample_rows.index)
-            bank.residuals.loc[overlap] = out_of_sample_rows.loc[overlap]
-        shared.append(replace(fit, residual_bank=bank))
-
-        # the ORIGINAL fit's forecast rows are honest out-of-sample residuals of this model
-        forecast_rows = fit.residual_bank.residuals.loc[fit.calendar.forecast_dates]
-        out_of_sample_rows = pd.concat([out_of_sample_rows, forecast_rows]) if len(out_of_sample_rows) else forecast_rows
-    return shared
-
-
-def build_var_df(
-    fits: list[WalkForwardSingleCalendarFit], var_setting: VarSetting,
-    residual_sharing: Literal["none", "carry_over"] = "none",
-) -> pd.DataFrame:
-    """
-    The stitched out-of-sample VaR: every window's forecast-period var_df (after the residual-sharing
-    decision), one after the other. Columns: varForecast, n_residuals_used, loss, window_id.
-
-    Checks that the windows tile: each window's train ends on the previous window's last forecast day, and the
-    result has every forecast date exactly once, without NaN. It feeds run_full_backtest_suite_single_window /
-    run_level_and_volatility_suite_single_window directly (they read varForecast and loss).
+    Each row keeps the predicted variance / sigma / mu_hat of the model that forecast that day. The bank is for
+    reading (create_combined_residuals_bank_and_read_var_df, graphs), not to train or extend. Checks that the windows tile: each window's train ends
+    on the previous window's last forecast day.
     """
     if not fits:
         raise ValueError("fits is empty.")
@@ -264,35 +211,49 @@ def build_var_df(
                 f"{previous.calendar.forecast_dates[-1].date()}."
             )
 
-    parts = []
-    for fit in share_residuals(fits, residual_sharing):
-        forecast_df = var_by_period(fit, var_setting)["forecast"].copy()
-        forecast_df["window_id"] = fit.window_id
-        parts.append(forecast_df)
-    # the bank's frame starts as object columns, so the VaR columns can come back as object: make them numbers
-    var_df = pd.concat(parts).astype({"varForecast": float, "loss": float, "n_residuals_used": int})
-
-    expected_dates = fits[0].calendar.forecast_dates
-    for fit in fits[1:]:
-        expected_dates = expected_dates.append(fit.calendar.forecast_dates)
-    if not var_df.index.equals(expected_dates):
-        raise ValueError("The stitched var_df does not cover every forecast date exactly once, in order.")
-    if var_df[["varForecast", "loss"]].isna().any().any():
-        raise ValueError("The stitched var_df has NaN in varForecast / loss.")
-    return var_df
-
-
-def stitched_residual_bank(fits: list[WalkForwardSingleCalendarFit]) -> ResidualBank:
-    """
-    One ResidualBank holding each window's out-of-sample (forecast-date) residual rows, in time order: what the
-    graphs read for the hover data (predicted_variance, sigma, mu_hat, standardized residual) and for the
-    model-output-vs-realized-variance plot. For reading only, it is not a bank to train or extend.
-    """
-    if not fits:
-        raise ValueError("fits is empty.")
     bank = fits[0].residual_bank.copy()
-    bank.residuals = pd.concat([fit.residual_bank.residuals.loc[fit.calendar.forecast_dates] for fit in fits])
+    bank.residuals = pd.concat(
+        [fits[0].residual_bank.residuals]
+        + [fit.residual_bank.residuals.loc[fit.calendar.forecast_dates] for fit in fits[1:]]
+    )
+    if not (bank.residuals.index.is_monotonic_increasing and bank.residuals.index.is_unique):
+        raise ValueError("The combined residual bank is not chronological without duplicates.")
     return bank
+
+
+def create_combined_residuals_bank_and_read_var_df(
+    fits: list[WalkForwardSingleCalendarFit],
+    var_confidence: float,
+    multi_day_var_calculation_window_size: int | None,
+    multi_day_var_min_periods: int | None = None,
+) -> pd.DataFrame:
+    """
+    The VaR of every forecast date of the walk-forward, read off the combined bank (build_combined_residual_bank_WITHOUT_CALC(fits), built
+    here), like calendar.var_from_residual_bank_forecast_period does for one calendar: how to read is chosen here,
+    per call (var_confidence, the quantile window with None = expanding, its min_periods, see
+    ResidualBank.multi_day_var), so the same fits can be read again any other way. Columns: varForecast,
+    n_residuals_used, loss, window_id (the window whose model forecast that day).
+
+    It feeds run_full_backtest_suite_single_window / run_level_and_volatility_suite_single_window directly (they
+    read varForecast and loss).
+    """
+    bank = build_combined_residual_bank_WITHOUT_CALC(fits)
+    forecast_dates = fits[0].calendar.forecast_dates
+    for fit in fits[1:]:
+        forecast_dates = forecast_dates.append(fit.calendar.forecast_dates)
+
+    var_df = bank.multi_day_var(
+        forecast_dates, var_confidence, multi_day_var_calculation_window_size, multi_day_var_min_periods
+    )
+    var_df["loss"] = pd.concat([fit.calendar.forecast_data["portfolio_loss"] for fit in fits]).loc[var_df.index]
+    var_df["window_id"] = pd.concat(
+        [pd.Series(fit.window_id, index=fit.calendar.forecast_dates) for fit in fits]
+    ).loc[var_df.index]
+    # the bank's frame starts as object columns, so the VaR columns can come back as object: make them numbers
+    var_df = var_df.astype({"varForecast": float, "loss": float, "n_residuals_used": int, "window_id": int})
+    if var_df[["varForecast", "loss"]].isna().any().any():
+        raise ValueError("The var_df has NaN in varForecast / loss.")
+    return var_df
 
 
 def var_df_windows(var_df: pd.DataFrame) -> list[dict]:

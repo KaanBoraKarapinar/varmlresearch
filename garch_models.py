@@ -54,10 +54,10 @@ def _one_step_variance(returns: pd.Series, params: pd.Series, arch_kwargs: dict,
     return variance / scale ** 2
 
 
-def _continue_series(train_returns: pd.Series, new_returns: pd.Series) -> pd.Series:
-    """The train series followed by the rows of new_returns that are after it (rows already in train are dropped)."""
-    new_returns = new_returns.sort_index()
-    after = new_returns.loc[new_returns.index > train_returns.index[-1]]
+def check_chronological_order_and_combine_dataframes(train_returns: pd.Series, forecast_returns: pd.Series) -> pd.Series:
+    """The train series followed by the rows of forecast_returns that are after it (rows already in train are dropped)."""
+    forecast_returns = forecast_returns.sort_index()
+    after = forecast_returns.loc[forecast_returns.index > train_returns.index[-1]]
     series = pd.concat([train_returns, after.astype(float)])
     if not (series.index.is_monotonic_increasing and series.index.is_unique):
         raise ValueError("garch: train and forecast returns do not form one chronological series.")
@@ -76,7 +76,7 @@ class TrainedGarchModel(TrainedModel):
     ):
         super().__init__(
             training_feature=training_feature, underlying_model=params, model_name="garch",
-            target_scale=training_feature.target_scale, feature_cols=feature_cols,
+            target=training_feature.target, feature_cols=feature_cols,
             residual_bank_in_sample=residual_bank_in_sample,
         )
         self.params = params
@@ -93,7 +93,7 @@ class TrainedGarchModel(TrainedModel):
         if len(missing):
             raise KeyError(f"feature_dates missing from forecast_feature.X_forecast_sample: {list(missing)}")
 
-        series = _continue_series(self.train_returns, X["portfolio_return"].astype(float))
+        series = check_chronological_order_and_combine_dataframes(self.train_returns, X["portfolio_return"].astype(float))
         variance = _one_step_variance(series, self.params, self.arch_kwargs, self.scale)
         values = DATA_QUALITY_check_variance_floor(
             variance.loc[feature_dates].to_numpy(), dates=feature_dates, context="TrainedGarchModel.predict_variance_batch_wide",
@@ -106,13 +106,13 @@ class TrainedGarchModel(TrainedModel):
     # ---- long: one GARCH per ticker -----------------------------------------------------------------
 
     def predict_variance_batch_long_by_ticker(
-        self, X_long: pd.DataFrame, id_cols: pd.DataFrame, feature_dates
+        self, X_long: pd.DataFrame, id_cols: pd.DataFrame, feature_dates, base_variance: pd.Series | None = None
     ) -> dict[str, pd.Series]:
         feature_dates = pd.DatetimeIndex(feature_dates)
         result: dict[str, pd.Series] = {}
         for ticker, rows in id_cols.groupby("ticker").groups.items():
             returns = pd.Series(X_long.loc[rows, "r"].to_numpy(dtype=float), index=id_cols.loc[rows, "Date"].to_numpy())
-            series = _continue_series(self.train_returns[ticker], returns)
+            series = check_chronological_order_and_combine_dataframes(self.train_returns[ticker], returns)
             variance = _one_step_variance(series, self.params[ticker], self.arch_kwargs, self.scale)
             missing = feature_dates.difference(variance.index)
             if len(missing):
@@ -126,8 +126,7 @@ class TrainedGarchModel(TrainedModel):
 
 
 def _garch_train_wide(
-    calendar: GroundTruthCalendar, training_feature: TrainingFeature, residual_bank: ResidualBank,
-    arch_kwargs: dict, scale: float,
+    training_feature: TrainingFeature, residual_bank: ResidualBank, arch_kwargs: dict, scale: float,
 ) -> TrainedGarchModel:
     X = training_feature.X_in_sample
     train_returns = X["portfolio_return"].astype(float).sort_index()
@@ -140,17 +139,16 @@ def _garch_train_wide(
     # same bank filling as tree_models._tree_train_wide, only the variances come from GARCH: the variance forecast
     # made from feature date f is FOR the bar after f, so the row is labeled by that outcome bar (own-day rule)
     actual_next = training_feature.DANGEROUS_r_next_in_sample
-    common_index = X.index.intersection(actual_next.index).intersection(training_feature.y_in_sample.index).sort_values()
     variance = _one_step_variance(train_returns, params, arch_kwargs, scale)
     predicted_variances = DATA_QUALITY_check_variance_floor(
-        variance.loc[common_index].to_numpy(), dates=common_index, context="garch_train (wide)",
+        variance.loc[X.index].to_numpy(), dates=X.index, context="garch_train (wide)",
     )
 
-    outcome_dates = calendar.next_bars(common_index)
+    outcome_dates = training_feature.training_feature_residual_outcome_dates
     residual_bank.start_training(outcome_dates[0], training_feature.frequency)
     residual_bank.training_safe_bulk_insert(
         dates=outcome_dates,
-        actual_returns=actual_next.loc[common_index].to_numpy(),
+        actual_returns=actual_next.to_numpy(),
         predicted_variances=predicted_variances,
     )
     model.residual_bank_in_sample = residual_bank
@@ -201,4 +199,4 @@ def garch_train(
         return _garch_train_long(calendar, training_feature, residual_bank, ewma_bank, arch_kwargs, scale)
     if ewma_bank is not None:
         raise ValueError("ewma_bank is only used by the long-format path.")
-    return _garch_train_wide(calendar, training_feature, residual_bank, arch_kwargs, scale)
+    return _garch_train_wide(training_feature, residual_bank, arch_kwargs, scale)

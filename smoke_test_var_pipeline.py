@@ -22,7 +22,7 @@ for p in (str(_HERE), str(_REPO_ROOT)):
 import pandas as pd
 
 import data_management as dm
-import feature_builders as fb
+from core import feature_builders as fb
 import tree_models as tm
 
 TICKERS = ["AAPL", "JPM", "XOM", "KO"]

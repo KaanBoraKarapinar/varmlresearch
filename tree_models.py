@@ -22,8 +22,9 @@ class TrainedTreeModel(TrainedModel):
             raise KeyError(f"{feature_date} not in forecast_feature.X_out_sample")
 
         row = X.loc[[feature_date], self.feature_cols].to_numpy(dtype=np.float32)
-        # the model predicts in target_scale units; divide back to real variance units
-        variance = float(DATA_QUALITY_check_variance_floor(self.underlying_model.predict(row) / self.target_scale, context="TreeModel.predict_variance_single_wide")[0])
+        base = None if forecast_feature.base_variance is None else forecast_feature.base_variance.loc[[feature_date]].to_numpy()
+        # the model predicts the target (see targets.py); its inverse gives the real variance units back
+        variance = float(DATA_QUALITY_check_variance_floor(self.target.inverse_to_variance(self.underlying_model.predict(row), base), context="TreeModel.predict_variance_single_wide")[0])
         return variance
 
     def predict_variance_batch_wide(self, forecast_feature: ForecastFeature, feature_dates) -> pd.Series:
@@ -34,8 +35,9 @@ class TrainedTreeModel(TrainedModel):
             raise KeyError(f"feature_dates missing from forecast_feature.X_out_sample: {list(missing)}")
 
         rows = X.loc[feature_dates, self.feature_cols].to_numpy(dtype=np.float32)
-        # the model predicts in target_scale units (y = r_next^2 * target_scale); divide back to real variance units
-        variances = DATA_QUALITY_check_variance_floor(self.underlying_model.predict(rows) / self.target_scale, dates=feature_dates, context=f"TreeModel.predict_variance_batch_wide with target_scale = {forecast_feature.target_scale}" )
+        base = None if forecast_feature.base_variance is None else forecast_feature.base_variance.loc[feature_dates].to_numpy()
+        # the model predicts the target (see targets.py); its inverse gives the real variance units back
+        variances = DATA_QUALITY_check_variance_floor(self.target.inverse_to_variance(self.underlying_model.predict(rows), base), dates=feature_dates, context=f"TreeModel.predict_variance_batch_wide with target = {self.target}" )
         return pd.Series(variances, index=feature_dates, name="predicted_variance")
 
 
@@ -57,7 +59,7 @@ def _tree_train_long(
     # both banks are seeded below, they need the trained model to score the training bars
     trained_model = TrainedTreeModel(
         training_feature=training_feature, underlying_model=model, model_name=model_name,
-        target_scale=training_feature.target_scale, feature_cols=training_feature.feature_cols,
+        target=training_feature.target, feature_cols=training_feature.feature_cols,
     )
 
     trained_model.residual_bank_in_sample, trained_model.ewma_variance_bank_in_sample = trained_model.long_format_calculate_training_standartized_residuals(
@@ -67,22 +69,22 @@ def _tree_train_long(
 
 
 def _tree_train_wide(
-    calendar: GroundTruthCalendar, training_feature: TrainingFeature, model_constructor, model_name: str,
+    training_feature: TrainingFeature, model_constructor, model_name: str,
     model_kwargs: dict, residual_bank: ResidualBank,
 ) -> TrainedTreeModel:
     feature_cols = training_feature.feature_cols
     actual_next = training_feature.DANGEROUS_r_next_in_sample
-    common_index = training_feature.X_in_sample.index.intersection(actual_next.index).intersection(training_feature.y_in_sample.index)
-    common_index = common_index.sort_values()  # training_safe_bulk_insert's bootstrap/general split relies on chronological order
+    feature_dates = training_feature.X_in_sample.index   # chronological, training_safe_bulk_insert's bootstrap/general split relies on it
 
-    X = training_feature.X_in_sample.loc[common_index, feature_cols].to_numpy(dtype=np.float32)
-    y = training_feature.y_in_sample.loc[common_index, "target"].to_numpy(dtype=np.float32)
+    X = training_feature.X_in_sample[feature_cols].to_numpy(dtype=np.float32)
+    y = training_feature.y_in_sample["target"].to_numpy(dtype=np.float32)
 
     model = model_constructor(**model_kwargs)
     model.fit(X, y)
 
-    # the model predicts in target_scale units; divide back to real variance units, same as predict_variance_batch_wide
-    predicted_variances = DATA_QUALITY_check_variance_floor(model.predict(X) / training_feature.target_scale, dates=common_index, context=f"{model_name}_train")
+    # the model predicts the target; its inverse gives real variance units, same as predict_variance_batch_wide
+    base = None if training_feature.base_variance is None else training_feature.base_variance.to_numpy()
+    predicted_variances = DATA_QUALITY_check_variance_floor(training_feature.target.inverse_to_variance(model.predict(X), base), dates=feature_dates, context=f"{model_name}_train")
 
     # training_safe_bulk_insert (not general_bulk_insert): the bank starts empty, and
     # general_bulk_insert can never seed a from-scratch bank (see
@@ -91,17 +93,17 @@ def _tree_train_wide(
     # residual_bank is SINGLE-USE: bound to this run and filled in place, see TrainedModel.long_format_calculate_training_standartized_residuals
     # own-day rule: the variance forecast made from feature date f is FOR the bar after f, and so is the return in
     # actual_next, so the row is labeled by that outcome bar (same as the long path and the forecast phase)
-    outcome_dates = calendar.next_bars(common_index)
+    outcome_dates = training_feature.training_feature_residual_outcome_dates
     residual_bank.start_training(outcome_dates[0], training_feature.frequency)
     residual_bank.training_safe_bulk_insert(
         dates=outcome_dates,
-        actual_returns=actual_next.loc[common_index].to_numpy(),
+        actual_returns=actual_next.to_numpy(),
         predicted_variances=predicted_variances,
     )
 
     return TrainedTreeModel(
         training_feature=training_feature, underlying_model=model, model_name=model_name,
-        target_scale=training_feature.target_scale, feature_cols=feature_cols, residual_bank_in_sample=residual_bank,
+        target=training_feature.target, feature_cols=feature_cols, residual_bank_in_sample=residual_bank,
     )
 
 
@@ -128,7 +130,7 @@ def tree_train(
         return _tree_train_long(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank, ewma_bank)
     if ewma_bank is not None:
         raise ValueError("ewma_bank is only used by the long-format path.")
-    return _tree_train_wide(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank)
+    return _tree_train_wide(training_feature, model_constructor, model_name, model_kwargs, residual_bank)
 
 
 def xgboost_train(

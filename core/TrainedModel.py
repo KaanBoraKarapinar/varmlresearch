@@ -18,7 +18,7 @@ class TrainedModel(ABC):
         training_feature: TrainingFeature,
         underlying_model: object,
         model_name: str,
-        target_scale: float,
+        target,
         feature_cols: list[str],
         residual_bank_in_sample: ResidualBank | None = None,
         ewma_variance_bank_in_sample: "EwmaVarianceBank | None" = None,
@@ -26,7 +26,8 @@ class TrainedModel(ABC):
         self.training_feature = training_feature
         self.underlying_model = underlying_model
         self.model_name = model_name
-        self.target_scale = target_scale
+        # targets.Target: its inverse turns the model output into a variance
+        self.target = target
         self.feature_cols = feature_cols
         self.residual_bank_in_sample = residual_bank_in_sample
         self.ewma_variance_bank_in_sample = ewma_variance_bank_in_sample
@@ -40,12 +41,13 @@ class TrainedModel(ABC):
         """Predict the variances for the given feature dates (wide/single-ticker feature)."""
 
     def predict_variance_batch_long_by_ticker(
-        self, X_long: pd.DataFrame, id_cols: pd.DataFrame, feature_dates
+        self, X_long: pd.DataFrame, id_cols: pd.DataFrame, feature_dates, base_variance: pd.Series | None = None
     ) -> dict[str, pd.Series]:
         """
         Splits a long-format (one row per (Date, ticker)) feature block into one
         date-indexed wide view per ticker via id_cols, and scores each with
-        predict_variance_batch_wide.
+        predict_variance_batch_wide. base_variance (row-aligned with X_long, only for a target that needs it)
+        is split the same way.
         """
         feature_dates = pd.DatetimeIndex(feature_dates)
         result: dict[str, pd.Series] = {}
@@ -53,12 +55,18 @@ class TrainedModel(ABC):
             ticker_X = X_long.loc[rows, self.feature_cols].set_axis(
                 id_cols.loc[rows, "Date"].to_numpy(), axis=0
             ).sort_index()
+            ticker_base = None
+            if base_variance is not None:
+                ticker_base = pd.Series(
+                    base_variance.loc[rows].to_numpy(), index=id_cols.loc[rows, "Date"].to_numpy()
+                ).sort_index()
             ticker_view = ForecastFeature(
                 start=ticker_X.index.min(), end=ticker_X.index.max(), feature_dates=ticker_X.index,
-                target_scale=self.target_scale, frequency=self.training_feature.frequency,
+                target=self.target, frequency=self.training_feature.frequency,
                 feature_cols=self.feature_cols, type="wide",
                 X_forecast_sample=ticker_X, y_forecast_sample=pd.DataFrame(),
                 DANGEROUS_r_next_forecast_sample=pd.Series(dtype=float), id_cols=None,
+                base_variance=ticker_base,
             )
             result[ticker] = self.predict_variance_batch_wide(ticker_view, feature_dates)
         return result
@@ -107,7 +115,9 @@ class TrainedModel(ABC):
         # feature_dates is the feature builder's responsibility (TrainingFeature.feature_dates),
         # not recomputed here from X_in_sample_id_cols.
         feature_dates = training_feature.feature_dates
-        diag_by_ticker = self.predict_variance_batch_long_by_ticker(training_feature.X_in_sample, training_feature.X_in_sample_id_cols, feature_dates)
+        diag_by_ticker = self.predict_variance_batch_long_by_ticker(
+            training_feature.X_in_sample, training_feature.X_in_sample_id_cols, feature_dates, training_feature.base_variance
+        )
         sigma_diag_df = pd.DataFrame({t: diag_by_ticker[t].to_numpy() for t in tickers}, index=feature_dates)
 
         # ---- EWMA correlation: warmup + TRAIN returns only (never forecast-period returns) ----
@@ -126,9 +136,11 @@ class TrainedModel(ABC):
         # last bar is a valid feature address too -- the seed cov already encodes that bar (see
         # EwmaVarianceBank.training_safe_bulk_insert). With enough warmup nothing is dropped. X_in_sample never
         # contains the last train date (its target/r_next is NaN by construction), so usable_dates always has a
-        # following bar -- calendar.next_bars gives outcome_dates, their paired own-day OUTCOME bar.
+        # following bar -- training_feature.training_feature_residual_outcome_dates pairs every feature date with its
+        # own-day OUTCOME bar.
         usable_dates = calendar.train_dates_past_burn_in(feature_dates, ewma_min_periods - 1)
-        outcome_dates = calendar.next_bars(usable_dates)
+        outcome_by_feature_date = pd.Series(training_feature.training_feature_residual_outcome_dates, index=feature_dates)
+        outcome_dates = pd.DatetimeIndex(outcome_by_feature_date.loc[usable_dates])
 
         # own-day rule: sigma_diag_df is forecast made FROM usable_dates[i]'s features, which is
         # FOR outcome_dates[i] -- re-key it to outcome_dates so general_bulk_insert's EWMA
@@ -207,7 +219,8 @@ class TrainedModel(ABC):
         feature_dates, outcome_dates = calendar.forecast_pairs
 
         diag_by_ticker = self.predict_variance_batch_long_by_ticker(
-            long_forecast_feature.X_forecast_sample, long_forecast_feature.id_cols, feature_dates
+            long_forecast_feature.X_forecast_sample, long_forecast_feature.id_cols, feature_dates,
+            long_forecast_feature.base_variance,
         )
         # own-day rule: the variance forecast made from feature_dates[i] is FOR outcome_dates[i]
         sigma_diag_df = pd.DataFrame({t: diag_by_ticker[t].to_numpy() for t in calendar.tickers}, index=outcome_dates)
