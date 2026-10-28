@@ -1,0 +1,17 @@
+store/
+mlruns.db
+mlartifacts/
+data_raw/
+
+# secrets and local settings
+.env
+.idea/
+.venv/
+.DS_Store
+
+# generated
+__pycache__/
+*.pyc
+
+# old files kept on disk, not in the repository
+archive/

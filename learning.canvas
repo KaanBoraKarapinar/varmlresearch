@@ -1,0 +1,34 @@
+{
+	"nodes":[
+		{"id":"63298318ea515dad","type":"text","text":"# Dataclass\n---\n\n* init ile self.train_bars = train bars almayi engellemek icin\n\n```python\nfrom dataclasses import dataclass \n@dataclass \nclass Window: \ntrain_bars: int \nforecast_bars: int \nexpanding: bool = False\n```\n\nformatinda yaziyorsun yerine\n\n* 1) default tanimlayabiliyorsun (yukaridaki expandinge false demek gibi)\n#### 2)MUTABLE DEFAULT YASAK.\n\n##### 3) init tarzi logic ile eklemekden vaz gectigin icin, yuklenenler olusturulanlar dogru mu kontrol icin `__post_init__` tanimlayabiliyorsun\n\n#### 4) field import ederek bazi ayarlaer cagirabilirsin\n(from dataclasses import dataclass, field\n\n![[Pasted image 20261019190650.png]]","x":-435,"y":-540,"width":455,"height":1120},
+		{"id":"6931d7e2ed3d98f7","type":"text","text":"# cagirabilecegin bazi field ayarlari","x":160,"y":100,"width":378,"height":124},
+		{"id":"d42d15efb400e65b","type":"text","text":"### init yerine logicle hesaplama\n![[Pasted image 20261019190730.png]]","x":109,"y":300,"width":371,"height":234},
+		{"id":"8151ce34c6c96a77","type":"text","text":"### esitlikte yok say\n![[Pasted image 20261019190745.png]]","x":531,"y":328,"width":389,"height":292},
+		{"id":"74ef868ecf27e3d1","type":"text","text":"### `__repr__` string representasyonunda yok say\n---\n![[Pasted image 20261019190828.png]]","x":109,"y":694,"width":371,"height":286},
+		{"id":"923d90ce3a2d592b","type":"text","text":"# @dataclass sonrasi verebilecegin bazi parametreler ","x":1000,"y":100,"width":412,"height":160},
+		{"id":"5106213e38e25693","type":"text","text":"# #SNIPPET = Cache ve SHA256 sinifi olusturma python kodu","x":-553,"y":1160,"width":662,"height":200},
+		{"id":"82bb35145adfe354","x":2080,"y":-680,"width":250,"height":60,"type":"text","text":"# Typing"},
+		{"id":"397a844ee1993ef5","x":2800,"y":-705,"width":440,"height":145,"color":"6","type":"text","text":"# Attrs\n---\n"},
+		{"id":"34aa82dc4ba44e62","x":3454,"y":-680,"width":706,"height":57,"type":"text","text":"# Parquet"},
+		{"id":"d251b0a3991aabb3","x":3190,"y":-360,"width":617,"height":1031,"type":"text","text":"# row based vs column based\n\n![[Pasted image 20261019201802.png]]\n\n-> her rowu tek tek gezmek yerine\n-> her biri ayrica kaydi tutualn COLUMNlar ile tutmak.\n\n\n## Parquet, columnlari ROW GROUP ilerek tutar.\n![[Pasted image 20261019201854.png]]"},
+		{"id":"bfe50d223799d2ab","x":3289,"y":820,"width":711,"height":660,"type":"text","text":"# Run Lenght Encoding\n---\n* Compression algoritmasi\n* Repeated datayi sikistirmaya dayali\n* ![[Pasted image 20261019203223.png]]\n* 2024-01-01lerden tekrar edenleri, siliyoruz, sadece bir tanesini tutuyoruz.\n* # SORTING BU DURUMDA COK ONEMLI\n\n"},
+		{"id":"a7f45ffa7188d1a2","x":3992,"y":-349,"width":648,"height":929,"type":"text","text":"# Data Lake\n- Data Lake, parquet dosyalarini bir baskasinin pcsinde tutmak gibi\n\n## Partitioning: \n* #### HER ZAMAN DATANIN TAMAMINI OKUMAK ISTEMIYORUZ, DOLAYISI ILE FARKLI KLASORLERE AYIRMA\n* ![[Pasted image 20261019203912.png]]\n* En temel ayirma mantigi gun bazli \n\n* # LOW CARDINALITY ile etmelisin\n\t* ### FACEBOOKTA DATE, SONRA CHANNELE GORE PARTITION EDIYORLARMIS\n\n# !!!!!!!!!!!!!HIGH CARDINALITY ILE (USER ID VS. GIBI SEYLER) ILE PARTITION ETMEMELISIN!!!!!!!!!!!!!!\n\n"},
+		{"id":"c319dad45091a9ab","x":2820,"y":1640,"width":682,"height":298,"type":"text","text":"# LOW CARDINALITY DEN HIGHEST CARDINALITYE GORE SIRALANMALI\n---\n![[Pasted image 20261019203410.png]]"},
+		{"id":"f49bc904fcc4d64c","x":3560,"y":1640,"width":599,"height":222,"type":"text","text":"# TEMEL KAZANCIN, DOSYA BOYUTUNDA AMA DOSYAYI OKUYUP GERI YAZARKEN OLUSAN MASRAFTA SAKLAMAKTANSA."},
+		{"id":"3169c258b751b865","x":4760,"y":-320,"width":400,"height":991,"type":"text","text":"# ELT VE ETL FARKI\n---\n\n---\n![[Pasted image 20261019205313.png]]"},
+		{"id":"cbc4a3c7a7995a0f","x":4720,"y":1060,"width":661,"height":580,"type":"text","text":"![[Pasted image 20261019210307.png]]"}
+	],
+	"edges":[
+		{"id":"b28f3e7429d41baf","fromNode":"63298318ea515dad","fromSide":"top","toNode":"6931d7e2ed3d98f7","toSide":"top"},
+		{"id":"5be3e32c475cf917","fromNode":"6931d7e2ed3d98f7","fromSide":"bottom","toNode":"d42d15efb400e65b","toSide":"top"},
+		{"id":"b447e628be3592b7","fromNode":"6931d7e2ed3d98f7","fromSide":"bottom","toNode":"8151ce34c6c96a77","toSide":"top"},
+		{"id":"c170f10ba242680f","fromNode":"6931d7e2ed3d98f7","fromSide":"bottom","toNode":"74ef868ecf27e3d1","toSide":"top"},
+		{"id":"a25158af798ef746","fromNode":"63298318ea515dad","fromSide":"top","toNode":"923d90ce3a2d592b","toSide":"top"},
+		{"id":"f427e571abaf963c","fromNode":"34aa82dc4ba44e62","fromSide":"bottom","toNode":"d251b0a3991aabb3","toSide":"top"},
+		{"id":"6d9b14134667f6bf","fromNode":"d251b0a3991aabb3","fromSide":"bottom","toNode":"bfe50d223799d2ab","toSide":"top"},
+		{"id":"7b8fdb925d0fb184","fromNode":"bfe50d223799d2ab","fromSide":"bottom","toNode":"c319dad45091a9ab","toSide":"top"},
+		{"id":"540c1e0cdfdacdd4","fromNode":"34aa82dc4ba44e62","fromSide":"bottom","toNode":"a7f45ffa7188d1a2","toSide":"top"},
+		{"id":"2b6138c19cb2b57c","fromNode":"bfe50d223799d2ab","fromSide":"bottom","toNode":"f49bc904fcc4d64c","toSide":"top"},
+		{"id":"017cec1bd1dc6a64","fromNode":"3169c258b751b865","fromSide":"bottom","toNode":"cbc4a3c7a7995a0f","toSide":"top"}
+	]
+}

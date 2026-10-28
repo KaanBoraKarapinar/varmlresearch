@@ -808,45 +808,13 @@ test_confidence: float : Backtest'in ne kadar kesinlikle karar vereceği
 # Walk Forward Experiment
 
 ```python
-
 setting = wf.WalkForwardSetting(
-    train_bars=756,        # 3 yıl train
-    forecast_bars=252,     # her model 252 gün tahmin eder, sonra pencere 252 bar ilerler
-    expanding=False,       # False: kayan pencere (hep 756 bar); True: baştan büyüyen
-    warmup_bars=30,        # train başından önceki ısınma barları (sadece rolling/EWMA ısınması)
+    df, TICKERS, WEIGHTS,
+    train_bars=756, forecast_bars=252, expanding=False, warmup_bars=30,
+    start_date=None, end_date=None,       # None: verinin başı / sonu
 )
-calendars = setting.make_calendars(df, TICKERS, WEIGHTS)     # her pencere için bir takvim
-
-
-recipe = wf.ModelRecipe(
-    'long',                                   # 'long' | 'wide'
-    model_family='xgboost',                   # 'xgboost' | 'garch' | 'ewma' (modelsiz)
-    target=SquaredReturn(scale=10000),        # ne tahmin edilir (RatioToBase, LogVariance, AbsReturn da var)
-    features=FeatureSpec.default(),           # hangi feature'lar
-    model_kwargs=dict(n_estimators=100, max_depth=3),   # xgboost'a gider (garch'ta arch_model'e)
-    mu_mode='constant', default_mu_hat=0.0,   # residual bank ayarı (eğitimde residual'lara gömülür)
-    ewma_lam=0.94, ewma_min_periods=30,       # EWMA korelasyon bank'ı (sadece long)
-)
-
-fits = wf.train_walk_forward(calendars, recipe)    # her pencere için bir WalkForwardSingleCalendarFit
-
-
-var_df = wf.create_combined_residuals_bank_and_read_var_df(
-    fits,                                          # birleşik residual bank'ı içeride kurar ve VaR'ı ondan okur
-    var_confidence=0.95,                           # alt %5 quantile
-    multi_day_var_calculation_window_size=252,     # int: son N residual; None: eldeki tüm residual'lar (expanding)
-    multi_day_var_min_periods=30,                  # bir günün VaR alması için gereken en az önceki residual
-)
-# var_df sütunları: varForecast, n_residuals_used, loss, window_id
-
-bank = wf.build_combined_residual_bank_WITHOUT_CALC(fits)    # aynı birleşik bank, VaR hesaplamadan (grafikler için)
-
-
-
-
-
+calendars = setting.make_calendars()  
 ```
-
 
 * Elimizdeki veri icin birden fazla calendar olusturarak, elimizdeki veriyi bircok pencereye cevirip ayni modeli farkli zaman dilimleri icin egitip, total olarak bütün periyotlar icerisinde ne kadar basarili oldugumuzu incelemek icin bir sistem.
 
@@ -854,28 +822,62 @@ bank = wf.build_combined_residual_bank_WITHOUT_CALC(fits)    # aynı birleşik b
 * ##### Tek bir experiment sonunda tek bir VaR Dataframei olusturulur.
 
 
-- 
+
 
 ## Class: WalkForwardSetting
 ```
+tickers_raw_price_data: pd.DataFrame = field(repr=False)
+tickers: list[str]
+weights: dict[str, float] | pd.Series
+
 train_bars: int
 forecast_bars: int = 21
+
 expanding: bool = False
 warmup_bars: int = 30
-residual_sharing: Literal["none", "carry_over"] = "none"
-```
 
-* train_bars = kac günlük/ barlik veri ile tahmin edecegiz?
+start_date: str | pd.Timestamp | None = None
+end_date: str | pd.Timestamp | None = None
+
+drop_market_closed: bool = True
+data_path: str | None = None
+```
+![[04_walk_forward.drawio.svg]]
+#### Train ve Forecast dönemlerini ayarlama
+
+* start_date , iceri verilen ilk tarih, end_date **son forecastin yapilacagi tarih**
+
+* 
+* **expanding** = train dönemi gittikce uzamali mi mi (önerilmez) yoksa sadece bu train bars kadarki periyot icerisinde mi kalmali
+
+* train_bars = kac günlük/ barlik veri ile tahmin edecegiz? ornegin bir yilin is gunleri 252.
 * forecast_bars = kac günü tahmin edecegiz
 * warmup_bars = normal calendarda oldugu gibi, train verisi icerisinde direkt olmayan ama train verisi icerisindeki gecmise yonelik verileri egitmek icin kac gun geriye bakabileceginin ayari
 
-* **expanding** = train dönemi gittikce uzamali mi mi (önerilmez) yoksa sadece bu train bars kadarki periyot icerisinde mi kalmali
+### Temel Fonksiyonlar
 
-
-
-### `def WalkForwardSetting.make_calendars(df, TICKERS, WEIGHTS)
+`def WalkForwardSetting.make_calendars()`
 * Ayarlar tanimlandiktan sonra onlara göre verilen dataframe uzerinden **calendarlari** olusturup döndürür.
-* 
+
+
+### Yardimci Fonksiyonlar
+
+
+`def _positions()`
+* Verilen tarih ayarlarina göre her bir train_start_pos, train_end_pos, forecast_end_post **INDEXLERINI/KONUNMLARINI** hesaplar.
+* ilk training positionunu `warmupbars+1` indexinde bulur
+* son bari end_date indexinde bulur.
+* `train_end_pos` hesaplayan bir döngü icerisinde, `forecast_bars` ekleyerek ilerler
+	* son durumda kalan bar eger daha kucukse, `min(train_end_pos + self.forecast_bars, last_pos)` yardimi ile
+
+`def window_table()`
+* Positionsu daha düzenli hale getirir, **WINDOW ID tanimlar, train start, train end, vsleri indexden GERCEK TARIH haline cevirir.**
+	* Dataframein indexi pd.Timestamp tipinde oldugu icin index tipi
+
+
+
+
+### 
 
 # Model Ayarlama, Featureleri Verme ve Train Etme
 ### Class: ModelRecipe
@@ -914,3 +916,20 @@ Olusturulan calendarlar ile modelleri üretir backtesting icin.
 
 
 
+
+
+
+# Parquet Kayit ve MLOPS plani
+
+![[Pasted image 20261021130747.png]]
+
+* Bir experiment, farkli bir seyi denedigimiz 
+
+## Core Run Selection / Modelleri Karsilastirma
+
+* Cevaplanmaya calisilan soru:
+	* **İki run'ın ortalama tick loss'u 0.00117 ve 0.00121, bunlarin arasindaki fark gercek mi? Yoksa test edilen döneme (örnegin koronada tahmin hatasi vs.) dayali mi?
+	* Bunu cevaplamak icin Hansen, Lunde ve Nason (2011)'in gelistridigi ve ARCH icerisinde hazirda tanimli olan `Model Confidence Set (MCS)` kullanildi.
+
+
+* rk351573156de200

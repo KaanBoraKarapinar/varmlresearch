@@ -78,6 +78,7 @@ class TrainedGarchModel(TrainedModel):
             training_feature=training_feature, underlying_model=params, model_name="garch",
             target=training_feature.target, feature_cols=feature_cols,
             residual_bank_in_sample=residual_bank_in_sample,
+            loss_definition=f"{arch_kwargs.get('dist', 'normal')} log-likelihood (arch)",
         )
         self.params = params
         self.train_returns = train_returns
@@ -188,7 +189,7 @@ def garch_train(
     Same call shape as tree_models.xgboost_train. residual_bank / ewma_bank are SINGLE-USE (see tree_train);
     ewma_bank is only used by the long path (None -> EwmaVarianceBank(calendar)), passing one for wide raises.
     arch_kwargs go to arch.arch_model on top of GARCH_DEFAULTS (e.g. o=1 for GJR, dist="t"); `scale` is the
-    return multiplier for the optimizer (default 100 = percent).
+    return multiplier for the optimizer (default 100: arch recommends returns in percent points).
     """
     scale = float(arch_kwargs.pop("scale", DEFAULT_SCALE))
     arch_kwargs = {**GARCH_DEFAULTS, **arch_kwargs}

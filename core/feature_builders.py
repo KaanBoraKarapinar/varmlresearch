@@ -5,8 +5,8 @@ What the features are comes from a FeatureSpec (feature_blocks.py), what the mod
 Target (targets.py); wide and long are two views of the same blocks:
 
     build_features(calendar, "long", spec, target)
-    build_long_features(calendar, windows, ewma_span, sq_return_lags, target_scale)   # the default spec, kept
-    build_wide_features(...)                                                          # for the old call sites
+
+The spec, the target and the calendar must all be in the same unit (percent | log).
 """
 
 from __future__ import annotations
@@ -22,27 +22,31 @@ from .targets import SquaredReturn, Target
 def build_features(
         calendar: GroundTruthCalendar,
         model_format: str,
-        spec: FeatureSpec | None = None,
-        target: Target | None = None,
+        spec: FeatureSpec,
+        target: Target,
 ) -> tuple[TrainingFeature, ForecastFeature]:
     """
-    spec None -> FeatureSpec.default(), target None -> SquaredReturn(1.0).
-
     The blocks are computed twice, so the train rows can never see a forecast-period return:
     train rows from the train side only (warmup + train), forecast rows from the merged data (warmup + train +
     forecast: the last train bar + the forecast dates, see calendar.forecast_feature_dates, need the history).
     """
     if model_format not in ("wide", "long"):
         raise ValueError(f"model_format must be 'wide' or 'long', got {model_format!r}")
-    spec = spec or FeatureSpec.default()
-    target = target or SquaredReturn(1.0)
+    if model_format == "wide" and not target.supports_wide:
+        raise ValueError(f"{type(target).__name__} has no wide format (its series exist per ticker, not for the portfolio): use 'long'.")
+    for name, unit in (("spec", spec.unit), ("target", target.unit)):
+        if unit != calendar.unit:
+            raise ValueError(f"The {name} is in unit {unit!r} but the calendar is in unit {calendar.unit!r}.")
 
     tickers = list(calendar.tickers)
     columns = tickers + ["portfolio_return"]
-    train_frame = _frame(calendar.train_data_with_warmup[columns], tickers, spec, target, model_format)
-    forecast_frame = _frame(calendar.DANGEROUS_merged_warmedup_FORECAST_data[columns], tickers, spec, target, model_format)
+    train_frame = _frame(
+        calendar.train_data_with_warmup[columns], tickers, spec, target, model_format, calendar.train_additional_data_with_warmup)
+    forecast_frame = _frame(
+        calendar.DANGEROUS_merged_warmedup_FORECAST_data[columns], tickers, spec, target, model_format,
+        calendar.DANGEROUS_merged_warmedup_FORECAST_additional_data)
 
-    feature_cols = [c for c in train_frame.columns if c not in ("Date", "ticker", "r_next", "ewma_base_variance")]
+    feature_cols = [c for c in train_frame.columns if c not in ("Date", "ticker", "r_next", "target_next", "ewma_base_variance")]
     if not feature_cols:
         raise ValueError("The FeatureSpec produced no feature for this view.")
 
@@ -59,6 +63,8 @@ def build_features(
             f"No usable {model_format}-format rows in forecast window [{calendar.forecast_start} .. {calendar.forecast_end}].")
 
     clean_mask = train_full["r_next"].notna()
+    if "target_next" in train_full.columns:     # the target is made from the next bar's additional data value: it must be known too
+        clean_mask &= train_full["target_next"].notna()
     train_clean = train_full.loc[clean_mask]
     train_last = train_full.loc[~clean_mask]
     if train_clean.empty:
@@ -108,25 +114,29 @@ def build_features(
     return training_feature, forecast_feature
 
 
-def _frame(returns, tickers, spec, target, model_format) -> pd.DataFrame:
-    """The features, r_next and (if the target needs it) the EWMA base variance of every row of `returns`."""
-    features = spec.compute(returns, tickers)
-    ewma_base_variance = target.ewma_base_variance(returns)   # None unless the target needs a base variance
+def _frame(returns, tickers, spec, target, model_format, additional=None) -> pd.DataFrame:
+    """The features, r_next and (if the target needs it) the EWMA base variance of every row of `returns`. additional: the additional feature data of the same bars."""
+    features = spec.compute(returns, tickers, additional)
+    ewma_base_variance = target.ewma_base_variance(returns, additional)   # None unless the target needs a base variance
     r_next = returns.shift(-1)
+    target_next = target.next_outcome(returns, additional)               # None unless the target is made from the additional data
 
     if model_format == "wide":
         return _wide_frame(returns, features, r_next["portfolio_return"],
                            None if ewma_base_variance is None else ewma_base_variance["portfolio_return"])
-    return _long_frame(returns, tickers, features, r_next, ewma_base_variance)
+    return _long_frame(returns, tickers, features, r_next, ewma_base_variance, target_next)
 
 
 def _wide_frame(returns, features, r_next_portfolio, ewma_base_variance_portfolio) -> pd.DataFrame:
     """Every series' features side by side: '<series>_<feature>' (the raw return keeps the series name)."""
     columns = {}
-    for name, (values, long_only) in features.items():
+    for name, (values, long_only, market_wide) in features.items():
         if long_only:
             continue
-        for s in returns.columns:
+        if market_wide:
+            columns[name] = values["portfolio_return"]      # the same for every series: one column
+            continue
+        for s in values.columns:       # a feature without a portfolio series (a per-ticker additional feature) has no portfolio column
             columns[s if name == "r" else f"{s}_{name}"] = values[s]
     frame = pd.DataFrame(columns, index=returns.index)
     frame["r_next"] = r_next_portfolio
@@ -135,13 +145,15 @@ def _wide_frame(returns, features, r_next_portfolio, ewma_base_variance_portfoli
     return frame
 
 
-def _long_frame(returns, tickers, features, r_next, ewma_base_variance) -> pd.DataFrame:
+def _long_frame(returns, tickers, features, r_next, ewma_base_variance, target_next=None) -> pd.DataFrame:
     """One row per (Date, ticker), sorted by Date then ticker: every feature's column of that ticker."""
     parts = []
     for ticker in tickers:
-        columns = {name: values[ticker] for name, (values, long_only) in features.items()}
+        columns = {name: values[ticker] for name, (values, long_only, market_wide) in features.items()}
         part = pd.DataFrame(columns, index=returns.index)
         part["r_next"] = r_next[ticker]
+        if target_next is not None:
+            part["target_next"] = target_next[ticker]
         if ewma_base_variance is not None:
             part["ewma_base_variance"] = ewma_base_variance[ticker]
         part.insert(0, "ticker", ticker)
@@ -170,7 +182,8 @@ def _cut(frame, keep_index, feature_cols, target, model_format, label) -> pd.Dat
 
 def _y(rows: pd.DataFrame, target: Target) -> pd.DataFrame:
     ewma_base_variance = rows["ewma_base_variance"].to_numpy() if "ewma_base_variance" in rows.columns else None
-    return pd.DataFrame({"target": target.forward_make_y(rows["r_next"].to_numpy(), ewma_base_variance)}, index=rows.index)
+    outcome = rows["target_next"] if "target_next" in rows.columns else rows["r_next"]   # target_next: the next bar's value from the additional data
+    return pd.DataFrame({"target": target.forward_make_y(outcome.to_numpy(), ewma_base_variance)}, index=rows.index)
 
 
 def build_wide_features(
@@ -181,10 +194,12 @@ def build_wide_features(
         target_scale: float = 1.0,
         spec: FeatureSpec | None = None,
         target: Target | None = None,
+        *,
+        unit: str,
 ) -> tuple[TrainingFeature, ForecastFeature]:
-    """One row per bar, every series' features side by side. Target: the portfolio's next-bar return."""
-    spec = spec or FeatureSpec.default(windows, ewma_span, sq_return_lags)
-    return build_features(calendar, "wide", spec, target or SquaredReturn(target_scale))
+    """One row per bar, every series' features side by side. Target: the portfolio's next-bar return. `unit` is the calendar's."""
+    spec = spec or FeatureSpec.default(unit=unit, windows=windows, ewma_span=ewma_span, sq_return_lags=sq_return_lags)
+    return build_features(calendar, "wide", spec, target or SquaredReturn(target_scale, unit=unit))
 
 
 def build_long_features(
@@ -195,7 +210,9 @@ def build_long_features(
         target_scale: float = 1.0,
         spec: FeatureSpec | None = None,
         target: Target | None = None,
+        *,
+        unit: str,
 ) -> tuple[TrainingFeature, ForecastFeature]:
-    """One row per (bar, ticker), pooled across tickers. Target: that ticker's next-bar return."""
-    spec = spec or FeatureSpec.default(windows, ewma_span, sq_return_lags)
-    return build_features(calendar, "long", spec, target or SquaredReturn(target_scale))
+    """One row per (bar, ticker), pooled across tickers. Target: that ticker's next-bar return. `unit` is the calendar's."""
+    spec = spec or FeatureSpec.default(unit=unit, windows=windows, ewma_span=ewma_span, sq_return_lags=sq_return_lags)
+    return build_features(calendar, "long", spec, target or SquaredReturn(target_scale, unit=unit))

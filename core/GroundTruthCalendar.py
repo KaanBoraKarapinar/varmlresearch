@@ -2,39 +2,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 
-from .statistical_var_backtest_utils import run_full_backtest_suite_single_window
+from .additional_feature_data import check_additional_feature_data
 from .EwmaVarianceBank import EwmaVarianceBank
+from .units import check_unit
 
 if TYPE_CHECKING:
     from .ResidualBank import ResidualBank
-
-
-class VarPredictionRun:
-    """One named run of VaR forecasts: Date -> varForecast."""
-
-    def __init__(self, key: str, forecast_dates: pd.DatetimeIndex):
-        self.key = key
-        self.forecast_dates = forecast_dates
-        self.data = pd.DataFrame({"varForecast": np.nan}, index=forecast_dates)
-
-    def set(self, date, var_estimate: float) -> "VarPredictionRun":
-        date = pd.Timestamp(date)
-        if date not in self.forecast_dates:
-            raise KeyError(f"{date} not in this run's forecast_dates for key={self.key!r}")
-        self.data.loc[date, "varForecast"] = float(var_estimate)
-        return self
-
-    def set_batch(self, var_series: pd.Series) -> "VarPredictionRun":
-        missing = pd.DatetimeIndex(var_series.index).difference(self.forecast_dates)
-        if len(missing):
-            raise KeyError(f"dates outside forecast_dates for key={self.key!r}: {list(missing)}")
-        self.data.loc[var_series.index, "varForecast"] = var_series.to_numpy(dtype=float)
-        return self
-
-    def dropna(self) -> pd.DataFrame:
-        return self.data.dropna()
 
 
 class GroundTruthCalendar:
@@ -48,9 +22,12 @@ class GroundTruthCalendar:
         train_end,
         forecast_start,
         forecast_end,
+        unit: str,
         drop_market_closed: bool = True,
         warmup_bars: int = 0,
+        additional_feature_data: pd.DataFrame | None = None,
     ):
+        self.unit = check_unit(unit)   # the unit every return of this calendar (ticker and portfolio) is expressed in
         if not isinstance(warmup_bars, (int, np.integer)) or warmup_bars < 0:
             raise ValueError(f"warmup_bars must be a non-negative int, got {warmup_bars!r}")
         if not isinstance(frequency, pd.Timedelta):
@@ -66,9 +43,13 @@ class GroundTruthCalendar:
         self.tickers = list(tickers)
         self.weights = self._validate_weights(self.tickers, weights)
 
-        pct_returns = self._calculate_pct_return(tickers_raw_price_data)
-
-        full_data = self._compute_portfolio_return_and_loss_FOR_PCT_RETURN(pct_returns, self.tickers, self.weights)
+        # only the raw prices come in: the unit decides which return is computed from them
+        if self.unit == "log":
+            log_returns = self._calculate_log_return(tickers_raw_price_data)
+            full_data = self._compute_portfolio_return_and_loss_FOR_LOG_RETURN(log_returns, self.tickers, self.weights)
+        else:   # percent: the simple (pct_change) return, as a fraction
+            pct_returns = self._calculate_pct_return(tickers_raw_price_data)
+            full_data = self._compute_portfolio_return_and_loss_FOR_PCT_RETURN(pct_returns, self.tickers, self.weights)
 
         self.train_start, self.train_end, self.forecast_start, self.forecast_end = self._validate_windows(
             full_data, train_start, train_end, forecast_start, forecast_end
@@ -117,8 +98,29 @@ class GroundTruthCalendar:
             [self.warmup_data, self.train_data, self.forecast_data]
         ).sort_index()
 
+        # The additional feature data (columns (tag, scope), see additional_feature_data.py) is cut the same two ways as the
+        # price data, so the train rows of a feature can never see a forecast-period value:
+        #   train_additional_data_with_warmup                       <-> train_data_with_warmup
+        #   DANGEROUS_merged_warmedup_FORECAST_additional_data      <-> DANGEROUS_merged_warmedup_FORECAST_data
+        self.train_additional_data_with_warmup = None
+        self.DANGEROUS_merged_warmedup_FORECAST_additional_data = None
+        if additional_feature_data is not None:
+            check_additional_feature_data(additional_feature_data, self.tickers)
+            self.train_additional_data_with_warmup = self._additional_rows_on(
+                additional_feature_data, self.train_data_with_warmup.index, "warmup + train")
+            self.DANGEROUS_merged_warmedup_FORECAST_additional_data = self._additional_rows_on(
+                additional_feature_data, self.DANGEROUS_merged_warmedup_FORECAST_data.index, "warmup + train + forecast")
 
-        self.var_prediction_runs: dict[str, VarPredictionRun] = {}
+    @staticmethod
+    def _additional_rows_on(additional: pd.DataFrame, bars: pd.DatetimeIndex, label: str) -> pd.DataFrame:
+        """The rows of the additional feature data on exactly these bars."""
+        missing = bars.difference(additional.index)
+        if len(missing):
+            raise ValueError(
+                f"additional_feature_data has no row for {len(missing)} bar(s) of the {label} part "
+                f"(first: {missing[0].date()}): it must cover every bar of the calendar."
+            )
+        return additional.loc[bars]
 
     @staticmethod
     def _validate_weights(tickers: list[str], weights: dict[str, float] | pd.Series) -> pd.Series:
@@ -138,11 +140,33 @@ class GroundTruthCalendar:
 
 
     @staticmethod
-    def _compute_portfolio_return_and_loss_FOR_PCT_RETURN(tickers_pct_change_data: pd.DataFrame, tickers: list[str], weights: pd.Series) -> pd.DataFrame:
+    def _calculate_log_return(tickers_raw_price_data: pd.DataFrame) -> pd.DataFrame:
+        return np.log(tickers_raw_price_data.sort_index()).diff()
+
+    @staticmethod
+    def _compute_portfolio_return_and_loss_FOR_PCT_RETURN(
+        tickers_pct_change_data: pd.DataFrame, tickers: list[str], weights: pd.Series,
+    ) -> pd.DataFrame:
+        """The portfolio's percent return is the weighted sum of the tickers' percent returns (all as fractions)."""
         full_data = tickers_pct_change_data.sort_index().copy()
         portfolio_return = full_data[tickers].mul(weights, axis="columns").sum(axis=1, min_count=len(tickers))
         full_data["portfolio_return"] = portfolio_return
         full_data["portfolio_loss"] = -portfolio_return
+        return full_data
+
+    @staticmethod
+    def _compute_portfolio_return_and_loss_FOR_LOG_RETURN(
+        tickers_log_return_data: pd.DataFrame, tickers: list[str], weights: pd.Series,
+    ) -> pd.DataFrame:
+        """
+        The portfolio's log return is the log of its simple return, log(1 + sum w_i * (exp(r_i) - 1)), NOT the weighted
+        sum of the tickers' log returns (log returns do not add across assets).
+        """
+        full_data = tickers_log_return_data.sort_index().copy()
+        simple_returns = np.expm1(full_data[tickers])
+        portfolio_simple_return = simple_returns.mul(weights, axis="columns").sum(axis=1, min_count=len(tickers))
+        full_data["portfolio_return"] = np.log1p(portfolio_simple_return)
+        full_data["portfolio_loss"] = -full_data["portfolio_return"]
         return full_data
 
     @staticmethod
@@ -342,31 +366,16 @@ class GroundTruthCalendar:
     #def realized_loss(self, date) -> float:
         #return float(self._lookup(date)["portfolio_loss"])
 
-    def _get_or_create_run(self, key: str) -> VarPredictionRun:
-        if key not in self.var_prediction_runs:
-            self.var_prediction_runs[key] = VarPredictionRun(key, self.forecast_dates)
-        return self.var_prediction_runs[key]
-
-    def add_predicted_var(self, key: str, date, var_estimate: float) -> "GroundTruthCalendar":
-        self._get_or_create_run(key).set(date, var_estimate)
-        return self
-
-    def add_predicted_var_batch(self, key: str, var_series: pd.Series) -> "GroundTruthCalendar":
-        self._get_or_create_run(key).set_batch(var_series)
-        return self
-
     def var_from_residual_bank_forecast_period(
         self,
         bank: "ResidualBank",
         var_confidence: float,
         multi_day_var_calculation_window_size: int | None,
-        run_key: str,
         multi_day_var_min_periods: int | None = None,
     ) -> pd.DataFrame:
         """
         Reads the VaR of every forecast date off a bank that already holds the forecast window's
-        residuals (see calculate_multi_day_standart_residuals_from_*), adds the realized loss and records
-        the run under run_key (reusing a key overwrites that run).
+        residuals (see calculate_multi_day_standart_residuals_from_*) and adds the realized loss.
         How to read is chosen here, per call: var_confidence, the quantile window (None = expanding) and
         its min_periods, see ResidualBank.multi_day_var.
         """
@@ -374,7 +383,6 @@ class GroundTruthCalendar:
             self.forecast_dates, var_confidence, multi_day_var_calculation_window_size, multi_day_var_min_periods
         )
         var_df["loss"] = self.forecast_data.loc[var_df.index, "portfolio_loss"]
-        self.add_predicted_var_batch(run_key, var_df["varForecast"])
         return var_df
 
     def var_from_residual_bank_train_period(
@@ -387,7 +395,7 @@ class GroundTruthCalendar:
         """
         The VaR of the TRAIN dates the bank holds (in-sample), with the realized loss. The first
         multi_day_var_min_periods bank dates are dropped: they do not have that many prior residuals yet
-        (multi_day_var would raise). Not recorded as a run: var_prediction_runs / backtest are forecast-only.
+        (multi_day_var would raise).
         """
         train_dates = bank.residuals.index[bank.residuals.index.isin(self.train_data.index)]
         var_df = bank.multi_day_var(
@@ -406,8 +414,7 @@ class GroundTruthCalendar:
     ) -> pd.DataFrame:
         """
         The VaR of every train + forecast date the bank holds, with the realized loss. Same as
-        var_from_residual_bank_train_period: the first multi_day_var_min_periods bank dates are dropped and
-        no run is recorded.
+        var_from_residual_bank_train_period: the first multi_day_var_min_periods bank dates are dropped.
         """
         entire_dates = bank.residuals.index[bank.residuals.index.isin(self.train_data.index.append(self.forecast_dates))]
         var_df = bank.multi_day_var(
@@ -417,61 +424,17 @@ class GroundTruthCalendar:
         var_df["loss"] = self.DANGEROUS_merged_warmedup_FORECAST_data.loc[var_df.index, "portfolio_loss"]
         return var_df
 
-    def backtest(self, key: str, var_confidence: float, test_confidence: float = 0.95) -> dict:
-        if key not in self.var_prediction_runs:
-            raise KeyError(f"No run recorded under key={key!r}. Recorded keys: {list(self.var_prediction_runs)}")
-
-        run_df = self.var_prediction_runs[key].dropna()
-        if run_df.empty:
-            raise ValueError(f"var_prediction_runs[{key!r}] is empty, nothing to backtest.")
-
-        forecast_df = run_df.join(self.forecast_data["portfolio_loss"].rename("loss"))
-
-        return run_full_backtest_suite_single_window(
-            forecast_df=forecast_df,
-            start_date=forecast_df.index.min(),
-            end_date=forecast_df.index.max(),
-            var_confidence=var_confidence,
-            test_confidence=test_confidence,
-        )
-
 
 class DailyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
-        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit: str, drop_market_closed: bool = True, warmup_bars: int = 0, additional_feature_data: pd.DataFrame | None = None):
+        super().__init__(pd.Timedelta(hours=24), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit, drop_market_closed, warmup_bars, additional_feature_data)
 
 
 class HourlyGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
-        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit: str, drop_market_closed: bool = True, warmup_bars: int = 0, additional_feature_data: pd.DataFrame | None = None):
+        super().__init__(pd.Timedelta(hours=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit, drop_market_closed, warmup_bars, additional_feature_data)
 
 
 class MinuteGroundTruthCalendar(GroundTruthCalendar):
-    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed: bool = True, warmup_bars: int = 0):
-        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, drop_market_closed, warmup_bars)
-
-
-def plot_var_runs(calendar: GroundTruthCalendar, keys: list[str], title: str = "VaR Forecast vs Loss") -> "go.Figure":
-    import plotly.graph_objects as go
-
-    fig = go.Figure()
-
-    for key in keys:
-        if key not in calendar.var_prediction_runs:
-            raise KeyError(f"No run recorded under key={key!r}. Recorded keys: {list(calendar.var_prediction_runs)}")
-
-        run_df = calendar.var_prediction_runs[key].dropna()
-        fig.add_scatter(x=run_df.index, y=run_df["varForecast"], mode="lines", name=f"VaR Forecast ({key})")
-
-    reference_key = keys[0]
-    loss_df = calendar.var_prediction_runs[reference_key].dropna()
-    loss_series = calendar.data.loc[loss_df.index, "portfolio_loss"]
-    fig.add_scatter(x=loss_series.index, y=loss_series, mode="lines", name="Loss")
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Value",
-        template="plotly_white",
-    )
-    return fig
+    def __init__(self, tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit: str, drop_market_closed: bool = True, warmup_bars: int = 0, additional_feature_data: pd.DataFrame | None = None):
+        super().__init__(pd.Timedelta(minutes=1), tickers_raw_price_data, tickers, weights, train_start, train_end, forecast_start, forecast_end, unit, drop_market_closed, warmup_bars, additional_feature_data)

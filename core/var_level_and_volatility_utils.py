@@ -20,6 +20,10 @@ import pandas as pd
 
 from .statistical_var_backtest_utils import LOSS_COL, VAR_COL, _period_var_df
 
+# Runs that are compared must have the same realized loss. The same portfolio read from two downloads of the prices differs in the
+# last digits (about 1e-6 of a return), another portfolio differs a thousand times that on some day: this tells them apart.
+LOSS_AGREEMENT_TOLERANCE = 1e-5
+
 if TYPE_CHECKING:
     from .GroundTruthCalendar import GroundTruthCalendar
 
@@ -100,7 +104,7 @@ def exceedance_days_by_model(var_dfs: dict[str, pd.DataFrame], labels: bool = Tr
     for name, var_df in var_dfs.items():
         if not var_df.index.equals(first.index):
             raise ValueError(f"var_dfs[{name!r}] is on different dates than var_dfs[{names[0]!r}]: use the same period.")
-        if (var_df[LOSS_COL].astype(float) - first[LOSS_COL].astype(float)).abs().max() > 1e-12:
+        if (var_df[LOSS_COL].astype(float) - first[LOSS_COL].astype(float)).abs().max() > LOSS_AGREEMENT_TOLERANCE:
             raise ValueError(f"var_dfs[{name!r}] disagrees on the realized loss: they must come from the same calendar.")
 
     exceeded = pd.DataFrame({
@@ -185,6 +189,17 @@ def daily_tick_loss(forecast_df: pd.DataFrame, var_confidence: float) -> pd.Seri
     return pd.Series(np.where(u > 0, var_confidence * u, -(1 - var_confidence) * u), index=forecast_df.index, name="tick_loss")
 
 
+def qlike(variance, realized_squared_return, floor: float = 1e-10) -> float:
+    """
+    The QLIKE loss of variance forecasts against the realized squared return r^2: mean(r^2/h - ln(r^2/h) - 1), h = the
+    forecast. Lower is better, 0 would be a forecast equal to r^2 every day, a too LOW forecast is punished more than a
+    too high one. It does not depend on the unit or the scale of the returns, so it is comparable between models
+    (unlike a squared error in a model's own target units).
+    """
+    ratio = np.maximum(np.asarray(realized_squared_return, dtype=float), floor) / np.asarray(variance, dtype=float)
+    return float(np.mean(ratio - np.log(ratio) - 1))
+
+
 def compare_to_baseline(
     var_dfs: dict[str, pd.DataFrame], baseline: str, var_confidence: float, hac_lags: int = 5,
 ) -> pd.DataFrame:
@@ -206,7 +221,7 @@ def compare_to_baseline(
     for name, var_df in var_dfs.items():
         if not var_df.index.equals(base_df.index):
             raise ValueError(f"var_dfs[{name!r}] is on different dates than the baseline {baseline!r}: use the same period.")
-        if (var_df[LOSS_COL].astype(float) - base_df[LOSS_COL].astype(float)).abs().max() > 1e-12:
+        if (var_df[LOSS_COL].astype(float) - base_df[LOSS_COL].astype(float)).abs().max() > LOSS_AGREEMENT_TOLERANCE:
             raise ValueError(f"var_dfs[{name!r}] disagrees with the baseline on the realized loss.")
 
     import statsmodels.api as sm

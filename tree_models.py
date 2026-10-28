@@ -12,6 +12,19 @@ from core import (
 )
 
 
+_LOSS_NAMES = {
+    "reg:squarederror": "MSE", "squared_error": "MSE", "reg:gamma": "gamma deviance",
+    "reg:tweedie": "tweedie deviance", "reg:pseudohubererror": "pseudo-Huber",
+}
+
+
+def _loss_definition(model) -> str:
+    """The loss the fitted tree model minimized: xgboost's objective or sklearn's criterion (both default to squared error)."""
+    params = model.get_params()
+    objective = params.get("objective") or params.get("criterion") or "squared_error"
+    return _LOSS_NAMES.get(objective, str(objective))
+
+
 class TrainedTreeModel(TrainedModel):
 
     def predict_variance_single_wide(self, forecast_feature: ForecastFeature, feature_date) -> float:
@@ -45,7 +58,7 @@ class TrainedTreeModel(TrainedModel):
 
 def _tree_train_long(
     calendar: GroundTruthCalendar, training_feature: TrainingFeature, model_constructor, model_name: str,
-    model_kwargs: dict, residual_bank: ResidualBank, ewma_bank: EwmaVarianceBank,
+    model_kwargs: dict, residual_bank: ResidualBank, ewma_bank: EwmaVarianceBank, existing_model=None,
 ) -> TrainedTreeModel:
     if training_feature.X_in_sample_id_cols is None:
         raise ValueError("_tree_train_long requires training_feature.X_in_sample_id_cols (Date/ticker per row).")
@@ -53,13 +66,17 @@ def _tree_train_long(
     X = training_feature.X_in_sample.to_numpy(dtype=np.float32)
     y = training_feature.y_in_sample["target"].to_numpy(dtype=np.float32)
 
-    model = model_constructor(**model_kwargs)
-    model.fit(X, y)
+    if existing_model is None:
+        model = model_constructor(**model_kwargs)
+        model.fit(X, y)
+    else:
+        model = existing_model      # already trained (on another calendar): only the banks of THIS calendar are filled below
 
     # both banks are seeded below, they need the trained model to score the training bars
     trained_model = TrainedTreeModel(
         training_feature=training_feature, underlying_model=model, model_name=model_name,
         target=training_feature.target, feature_cols=training_feature.feature_cols,
+        loss_definition=_loss_definition(model),
     )
 
     trained_model.residual_bank_in_sample, trained_model.ewma_variance_bank_in_sample = trained_model.long_format_calculate_training_standartized_residuals(
@@ -104,52 +121,71 @@ def _tree_train_wide(
     return TrainedTreeModel(
         training_feature=training_feature, underlying_model=model, model_name=model_name,
         target=training_feature.target, feature_cols=feature_cols, residual_bank_in_sample=residual_bank,
+        loss_definition=_loss_definition(model),
     )
 
 
 
 ####
 
-def tree_train(
+def tree_train_or_load_existing_model(
     calendar: GroundTruthCalendar, training_feature: TrainingFeature, model_constructor, model_name: str,
     residual_bank: ResidualBank,
     ewma_bank: EwmaVarianceBank | None = None,
     model_kwargs: dict | None = None,
+    existing_model=None,
 ) -> TrainedTreeModel:
     """
+    Trains the model on the calendar's training rows, or (existing_model given) takes a model that was already trained, on
+    this calendar or on another one, and skips the fit. Either way the calendar's two banks are seeded by scoring the training
+    bars with the model, so the forecast days of THIS calendar can be scored afterwards.
+
     residual_bank / ewma_bank carry every setting of the two banks and are SINGLE-USE: training fills them in
     place and marks them `trained`, handing a trained bank to another training run raises (create new banks
     for every run). ewma_bank is only used by the long path (None -> EwmaVarianceBank(calendar) with its
     defaults); passing one for the wide path raises. An ewma_bank is built from a calendar and training
     checks it is the same calendar's tickers/weights.
+
+    existing_model works for the long format only: the features of a wide model are the columns of one calendar's portfolio.
     """
     model_kwargs = model_kwargs or {}
     if training_feature.type == "long":
         if ewma_bank is None:
             ewma_bank = EwmaVarianceBank(calendar)
-        return _tree_train_long(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank, ewma_bank)
+        return _tree_train_long(calendar, training_feature, model_constructor, model_name, model_kwargs, residual_bank, ewma_bank, existing_model)
+    if existing_model is not None:
+        raise ValueError("An existing model can only be used in the long format (a wide model is tied to the series of its own calendar).")
     if ewma_bank is not None:
         raise ValueError("ewma_bank is only used by the long-format path.")
     return _tree_train_wide(training_feature, model_constructor, model_name, model_kwargs, residual_bank)
 
 
+tree_train = tree_train_or_load_existing_model      # the old name
+
+
 def xgboost_train(
     calendar: GroundTruthCalendar, training_feature: TrainingFeature, residual_bank: ResidualBank,
     ewma_bank: EwmaVarianceBank | None = None,
+    existing_model=None,
     **xgb_kwargs,
 ) -> TrainedTreeModel:
     import xgboost as xgb
     defaults = dict(n_estimators=100, max_depth=3, learning_rate=0.05, verbosity=0, n_jobs=1)
     defaults.update(xgb_kwargs)
-    return tree_train(calendar, training_feature, xgb.XGBRegressor, "xgboost", residual_bank, ewma_bank, defaults)
+    return tree_train_or_load_existing_model(
+        calendar, training_feature, xgb.XGBRegressor, "xgboost", residual_bank, ewma_bank, defaults, existing_model,
+    )
 
 
 def random_forest_train(
     calendar: GroundTruthCalendar, training_feature: TrainingFeature, residual_bank: ResidualBank,
     ewma_bank: EwmaVarianceBank | None = None,
+    existing_model=None,
     **rf_kwargs,
 ) -> TrainedTreeModel:
     from sklearn.ensemble import RandomForestRegressor
     defaults = dict(n_estimators=200, max_depth=5, random_state=0)
     defaults.update(rf_kwargs)
-    return tree_train(calendar, training_feature, RandomForestRegressor, "random_forest", residual_bank, ewma_bank, defaults)
+    return tree_train_or_load_existing_model(
+        calendar, training_feature, RandomForestRegressor, "random_forest", residual_bank, ewma_bank, defaults, existing_model,
+    )

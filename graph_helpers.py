@@ -4,11 +4,14 @@ import plotly.colors as pc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from core.var_level_and_volatility_utils import daily_tick_loss, exceedance_day_details, exceedance_day_summary
+from core.units import format_value, plot_format
+from core.var_level_and_volatility_utils import LOSS_AGREEMENT_TOLERANCE, daily_tick_loss, exceedance_day_details, exceedance_day_summary
 
 
 def _var_hover_data(var_df, residualbank):
     """var_df + the bank's predicted_variance / predicted_sigma / mu_hat / standardized_residual per date; returns (merged, hover_cols, hovertemplate)."""
+    f = plot_format()
+    pct = '%{y:' + f['hoverformat'] + '}' + f['hoversuffix']
     resid_df = residualbank.to_dataframe()
 
     merged = var_df.join(
@@ -20,10 +23,10 @@ def _var_hover_data(var_df, residualbank):
     hover_cols = ['predicted_variance', 'predicted_sigma', 'mu_hat', 'standardized_residual'] + (['n_residuals_used'] if has_n_used else [])
     hovertemplate = (
         '<b>%{x}</b><br>' +
-        'VaR Forecast: %{y:.2%}<br>' +
+        'VaR Forecast: ' + pct + '<br>' +
         'predicted_variance (model_output): %{customdata[0]:.3e}<br>' +
-        'predicted_sigma (sqrt of variance): %{customdata[1]:.2%}<br>' +
-        'mu_hat: %{customdata[2]:.2%}<br>' +
+        'predicted_sigma (sqrt of variance): %{customdata[1]:' + f['hoverformat'] + '}' + f['hoversuffix'] + '<br>' +
+        'mu_hat: %{customdata[2]:' + f['hoverformat'] + '}' + f['hoversuffix'] + '<br>' +
         'Standardized Residual: %{customdata[3]:.2f}' +
         ('<br>Residuals used: %{customdata[4]:.0f}' if has_n_used else '') +
         '<extra></extra>'
@@ -86,6 +89,7 @@ def _add_exceedance_markers(fig, merged):
     Highlights the days with loss > varForecast (VaR exceedances) on the realized-loss line: a red ring plus the
     running number 1, 2, 3, ... in date order, so the count in the legend and the numbers on the graph agree.
     """
+    f = plot_format()
     exceeded = merged[merged['loss'] > merged['varForecast']]
     if exceeded.empty:
         return
@@ -103,7 +107,8 @@ def _add_exceedance_markers(fig, merged):
         customdata=np.column_stack([numbers, exceeded['varForecast'].to_numpy(dtype=float)]),
         hovertemplate=(
             '<b>%{x}</b><br>Exceedance #%{customdata[0]}<br>'
-            'Realized Loss: %{y:.2%}<br>VaR Forecast: %{customdata[1]:.2%}<extra></extra>'
+            'Realized Loss: %{y:' + f['hoverformat'] + '}' + f['hoversuffix'] +
+            '<br>VaR Forecast: %{customdata[1]:' + f['hoverformat'] + '}' + f['hoversuffix'] + '<extra></extra>'
         ),
     ))
 
@@ -136,6 +141,7 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
     -------
     fig : plotly.graph_objects.Figure
     """
+    f = plot_format()
     merged, hover_cols, hovertemplate = _var_hover_data(var_df, residualbank)
 
     fig = go.Figure()
@@ -157,7 +163,7 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
         name='Realized Loss',
         line=dict(color='steelblue', width=1),
         marker=dict(size=4),
-        hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:.2%}<extra></extra>'
+        hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:' + f['hoverformat'] + '}' + f['hoversuffix'] + '<extra></extra>'
     ))
 
     if mark_exceedances:
@@ -173,7 +179,8 @@ def plot_var_vs_loss(var_df, residualbank, title='VaR Forecast vs Realized Loss'
         template='plotly_white',
         hovermode='x unified',
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        yaxis_tickformat='.1%'
+        yaxis_tickformat=f['tickformat'],
+        yaxis_ticksuffix=f['ticksuffix'],
     )
 
     if time_navigation:
@@ -267,9 +274,10 @@ def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)'
 
     losses = pd.concat({name: var_df['loss'] for name, (var_df, _) in runs.items()}, axis=1)
     loss = losses.bfill(axis=1).iloc[:, 0]
-    if losses.sub(loss, axis=0).abs().max().max() > 1e-12:
+    if losses.sub(loss, axis=0).abs().max().max() > LOSS_AGREEMENT_TOLERANCE:
         raise ValueError("The runs disagree on the realized loss: they must all come from the same calendar.")
 
+    f = plot_format()
     colors = pc.qualitative.Plotly
     fig = go.Figure()
     for i, (name, (var_df, residualbank)) in enumerate(runs.items()):
@@ -291,7 +299,7 @@ def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)'
         name='Realized Loss',
         line=dict(color='steelblue', width=1),
         marker=dict(size=4),
-        hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:.2%}<extra></extra>'
+        hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:' + f['hoverformat'] + '}' + f['hoversuffix'] + '<extra></extra>'
     ))
 
     if calendar is not None:
@@ -304,7 +312,8 @@ def plot_var_models_vs_loss(runs, title='VaR Forecast vs Realized Loss (models)'
         template='plotly_white',
         hovermode='x unified',
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        yaxis_tickformat='.1%'
+        yaxis_tickformat=f['tickformat'],
+        yaxis_ticksuffix=f['ticksuffix'],
     )
 
     if time_navigation:
@@ -511,6 +520,8 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
     colors = pc.qualitative.Plotly
     n_days = len(days)
     losses = var_dfs[names[0]]['loss'].astype(float)
+    f = plot_format()
+    hover = '%{y:' + f['hoverformat'] + '}' + f['hoversuffix']
 
     # every number shown below is computed by the helpers (core.var_level_and_volatility_utils), not here
     summary = exceedance_day_summary(var_dfs, days)                       # per day, across the models
@@ -521,8 +532,8 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
     for day in days:
         s = summary.loc[day]
         titles += [
-            f"<b>{day.date()}</b>  |  loss {s['loss']:.2%}  |  missed by {int(s['n_missed'])} of {int(s['n_models'])} models<br>"
-            f"diff (loss - VaR): avg {s['avg_difference']:+.2%}  |  min {s['min_difference']:+.2%}  |  max {s['max_difference']:+.2%}",
+            f"<b>{day.date()}</b>  |  loss {format_value(s['loss'])}  |  missed by {int(s['n_missed'])} of {int(s['n_models'])} models<br>"
+            f"diff (loss - VaR): avg {format_value(s['avg_difference'], signed=True)}  |  min {format_value(s['min_difference'], signed=True)}  |  max {format_value(s['max_difference'], signed=True)}",
             '',
         ]
 
@@ -549,12 +560,12 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
             fig.add_trace(go.Scatter(
                 x=part.index, y=part['varForecast'], mode='lines', name=name, legendgroup=name, showlegend=first,
                 line=dict(color=colors[i % len(colors)], width=2),
-                hovertemplate=f'<b>%{{x}}</b><br>{name} VaR: %{{y:.2%}}<extra></extra>',
+                hovertemplate=f'<b>%{{x}}</b><br>{name} VaR: ' + hover + '<extra></extra>',
             ), row=row, col=1)
         fig.add_trace(go.Scatter(
             x=window, y=losses.loc[window], mode='lines+markers', name='Realized Loss', legendgroup='loss',
             showlegend=first, line=dict(color='black', width=2), marker=dict(size=5),
-            hovertemplate='<b>%{x}</b><br>Realized Loss: %{y:.2%}<extra></extra>',
+            hovertemplate='<b>%{x}</b><br>Realized Loss: ' + hover + '<extra></extra>',
         ), row=row, col=1)
 
         # the days in the window that at least one model missed, ringed, with the number of models that missed them
@@ -581,8 +592,9 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
             header=dict(values=['model', 'loss', 'VaR', 'diff', 'status'],
                         fill_color='lightgray', align='left', font=dict(size=10), height=22),
             cells=dict(
-                values=[list(rows.index), [f'{v:.2%}' for v in rows['loss']], [f'{v:.2%}' for v in rows['var_forecast']],
-                        [f'{v:+.2%}' for v in rows['difference']],
+                values=[list(rows.index), [format_value(v) for v in rows['loss']],
+                        [format_value(v) for v in rows['var_forecast']],
+                        [format_value(v, signed=True) for v in rows['difference']],
                         ['exceeded' if hit else 'not exceeded' for hit in rows['exceeded']]],
                 fill_color=[tint] * 5, font=dict(color=[ink] * 5, size=10), align='left', height=22,
             ),
@@ -600,7 +612,7 @@ def plot_exceedance_days_focus(var_dfs, days, window_bars=10, row_height=330):
                     font=dict(size=11)),
     )
     fig.update_annotations(font_size=12)              # the day titles
-    fig.update_yaxes(tickformat='.1%', tickfont=dict(size=10))
+    fig.update_yaxes(tickformat=f['tickformat'], ticksuffix=f['ticksuffix'], tickfont=dict(size=10))
     fig.update_xaxes(tickformat='%b %d', tickfont=dict(size=10))
     return fig
 
