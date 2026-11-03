@@ -1,7 +1,7 @@
 """
 Experiment: the RV models with the market features added (VIX, S&P 500 return, Treasury yield spreads), train 756 / forecast 21 from 2016-03.
 
-    python train_macro_experiment.py
+    python training/train_macro_experiment.py
 
 Needs data_general/RV_sip.csv, vix.csv, sp500.csv, us3m.csv, us5y.csv, us10y.csv, us30y.csv.
 The additional data is part of the walk-forward's identity, so the baselines are trained again on this walk-forward.
@@ -11,6 +11,7 @@ The additional data is part of the walk-forward's identity, so the baselines are
     ..._lags                                 + RvLags((1, 2, 3)): rv_lag_1..3 (rv_har_lags: RV features + lags without the market features)
     ..._ticker                               + TickerOneHot (drv_har_ticker, rv_macro_ticker, drv_macro_ticker)
 """
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -18,14 +19,15 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import pandas as pd
 
 import core
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.feature_blocks import FeatureSpec, RvHar, RvLags, Sp500Return, TickerOneHot, Vix, YieldSpread10y3m, YieldSpread10y5y, YieldSpread30y10y
 from core.targets import RealizedVariance, RelativeRvChange
 

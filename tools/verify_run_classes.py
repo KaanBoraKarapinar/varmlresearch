@@ -1,7 +1,7 @@
 """
 Checks the three kinds of run (walk_forward.Run) against each other:
 
-    python verify_run_classes.py
+    python tools/verify_run_classes.py
 
 1. LoadedRun: the reading computed now (Run._compute_reading) equals the reading the saved run folder holds, for every saved run that has
    the default reading on disk (nothing is written).
@@ -13,20 +13,22 @@ import contextlib
 import dataclasses
 import io
 import os
+import sys
 import tempfile
 import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import numpy as np
 import pandas as pd
 
-import run_store as rs
-import train_23_experiment as e
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
+from training import train_23_experiment as e
 
 DEFAULT_READING = wf.Reading()
 TOLERANCE = 1e-12

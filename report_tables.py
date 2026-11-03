@@ -22,8 +22,8 @@ import pandas as pd
 from statsmodels.stats.multitest import multipletests
 
 import core
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.run_comparison import _dm_p_value
 
 STORE_ROOT = rs.STORE_ROOT

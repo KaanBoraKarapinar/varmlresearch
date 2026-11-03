@@ -15,8 +15,8 @@ import page_run_comparison
 import page_single_run
 import page_weight_adjustment
 import page_weight_comparison
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 
 # where the runs are: the MLflow index, its experiment (the one every training script logs to) and the run store
 TRACKING_URI = f"sqlite:///{dd.ROOT / 'mlruns.db'}"

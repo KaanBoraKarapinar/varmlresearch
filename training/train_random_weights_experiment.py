@@ -1,7 +1,7 @@
 """
 Experiment: the 23-ticker models applied to portfolios with RANDOM FIXED weights, against GARCH, EWMA and the historical VaR of the same portfolio.
 
-    python train_random_weights_experiment.py          (after train_23_experiment.py: it applies the models that script trained)
+    python training/train_random_weights_experiment.py          (after training/train_23_experiment.py: it applies the models that script trained)
 
 For every random weight vector over the 23 tickers one walk-forward is built (train 756 / forecast 21 from 2016-03-01, as in train_23_experiment.py):
     GARCH, EWMA and the historical VaR are computed for that portfolio (they read only its return series and, for the EWMA, the covariance),
@@ -12,6 +12,7 @@ The weights come from a Dirichlet distribution with a fixed seed: alpha 1 spread
 tickers (far from the market, where the per-ticker forecasts should count more).
 """
 import dataclasses
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -19,14 +20,15 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import numpy as np
 
-import run_store as rs
-import train_23_experiment as e
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
+from training import train_23_experiment as e
 
 PORTFOLIOS = {                      # name: (Dirichlet alpha, seed)
     "rw1": (1.0, 11),

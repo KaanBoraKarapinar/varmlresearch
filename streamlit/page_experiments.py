@@ -11,7 +11,7 @@ import streamlit as st
 import core
 import dashboard_data as dd
 import page_run_comparison as cmp
-import walk_forward as wf
+from core import walk_forward as wf
 
 
 @st.cache_data(show_spinner=False)

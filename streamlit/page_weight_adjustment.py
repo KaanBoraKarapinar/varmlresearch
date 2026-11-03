@@ -17,7 +17,7 @@ import core
 import dashboard_data as dd
 import dashboard_figures as figs
 import page_run_comparison as cmp
-import walk_forward as wf
+from core import walk_forward as wf
 from core.units import format_value
 
 

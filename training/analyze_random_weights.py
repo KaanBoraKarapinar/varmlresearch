@@ -2,20 +2,22 @@
 Analysis of train_random_weights_experiment.py: the 23-ticker models applied to portfolios with random fixed weights, against GARCH, EWMA and the
 historical VaR of the same portfolio.
 
-    python analyze_random_weights.py            prints the tables and saves one experiment per random portfolio (store/experiments)
+    python training/analyze_random_weights.py   prints the tables and saves one experiment per random portfolio (store/experiments)
 
 For every portfolio (and for the equal-weight 1/23 one as the reference): the mean tick loss of every model, its difference to the GARCH of the same
 portfolio in % (negative = better), the Diebold-Mariano p-value (HAC) of that difference and its Holm correction over the 7 comparisons of the portfolio.
 The summary over the 5 random portfolios counts in how many of them a model is ahead of GARCH: the portfolios are drawn from the same 23 stocks, so
 they are not independent samples.
 """
+import sys
 import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import numpy as np
@@ -23,11 +25,11 @@ import pandas as pd
 from statsmodels.stats.multitest import multipletests
 
 import core
-import run_store as rs
-import train_23_experiment as e
-import train_random_weights_experiment as t
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.run_comparison import _dm_p_value
+from training import train_23_experiment as e
+from training import train_random_weights_experiment as t
 
 pd.set_option("display.width", 250); pd.set_option("display.max_columns", 30)
 PERIODS = {"whole": ("2019-03-04", "2100-01-01"), "crash": ("2020-02-19", "2020-06-30"), "after": ("2020-07-01", "2100-01-01")}

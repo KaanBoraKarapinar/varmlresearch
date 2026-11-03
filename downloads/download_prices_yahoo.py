@@ -2,16 +2,16 @@
 Daily adjusted close prices from Yahoo Finance, one CSV like data_general/4_ticker_data_2010_2026.csv
 (Date index, one column per ticker, adjusted for splits and dividends).
 
-    python download_prices_yahoo.py
+    python downloads/download_prices_yahoo.py
 
-The 5-minute bars and the realized variance of the same tickers come from alpaca_calculate_rv.py.
+The 5-minute bars and the realized variance of the same tickers come from downloads/alpaca_calculate_rv.py.
 """
 from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
-OUT_DIR = Path(__file__).resolve().parent / "data_general"
+OUT_DIR = Path(__file__).resolve().parent.parent / "data_general"       # the project root's data_general (this script lives in downloads/)
 START, END = "2010-01-04", "2026-07-01"          # END is exclusive: the last bar is 2026-06-30 (the end of the 4-ticker file)
 UNIVERSES = {
     "13tickers": ["AAPL", "MSFT", "NVDA", "AVGO", "GOOGL", "META", "NFLX", "AMZN", "HD", "MCD", "PG", "KO", "WMT"],

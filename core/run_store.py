@@ -46,18 +46,18 @@ import numpy as np
 import pandas as pd
 
 import core
-import walk_forward as wf
+from core import EwmaVarianceBank
+from core import walk_forward as wf
+from core.ResidualBank import RESIDUAL_COLS
 # the run read back from disk is walk_forward.LoadedRun; run_store keeps the layout on disk, the saving and the views over runs
-from walk_forward import (
+from core.walk_forward import (
     LoadedRun, Reading, Run, _calendar_name, _json_default, _parquet_metadata, _read_json, _to_parquet, _write_json,
     config_to_dict,
 )
-from core import EwmaVarianceBank
-from core.ResidualBank import RESIDUAL_COLS
 
 STORE_ROOT = Path("store")
 _SETTINGS_DIR = "WalkForwardSetting"
-_REPO_DIR = Path(__file__).resolve().parent
+_REPO_DIR = Path(__file__).resolve().parent.parent       # the project root (this file lives in core/): the git commands of the code info run there
 
 
 # --------------------------------------------------------------------------------------------------

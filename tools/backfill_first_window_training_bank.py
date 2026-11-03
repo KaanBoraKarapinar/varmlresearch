@@ -2,8 +2,8 @@
 Writes WALK_FORWARD_FIRST_WINDOW_TRAINING_BANK_FOR_RECALCULATING_RESIDUALS.parquet into the saved runs that were stored before the
 file existed (new runs get it from run_store.save_walk_forward_run).
 
-    python backfill_first_window_training_bank.py            all runs with an ewma bank and without the file
-    python backfill_first_window_training_bank.py --dry-run  only list what would be done
+    python tools/backfill_first_window_training_bank.py            all runs with an ewma bank and without the file
+    python tools/backfill_first_window_training_bank.py --dry-run  only list what would be done
 
 The training days of the first window come from the run's raw_ewma_banks/ when it has them. A slim run has none, so the first window
 alone is filled again with the run's own saved model (wf.fit_window; nothing is trained), and its forecast rows are checked against the
@@ -16,15 +16,16 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import numpy as np
 import pandas as pd
 
-import run_store as rs
-import train_23_experiment as e
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
+from training import train_23_experiment as e
 
 TOLERANCE = 1e-9
 
@@ -58,7 +59,7 @@ def from_first_window_fit(run: wf.LoadedRun) -> pd.DataFrame:
 def main() -> None:
     dry = "--dry-run" in sys.argv
     runs = rs.load_runs()
-    todo = [r for r in runs if (r.has_ewma_bank and not r.has_first_window_training_bank]
+    todo = [r for r in runs if r.has_ewma_bank and not r.has_first_window_training_bank]
     print(f"{len(runs)} runs, {len(todo)} to do", flush=True)
     failed = []
     for run in todo:

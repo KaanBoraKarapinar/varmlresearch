@@ -24,8 +24,8 @@ import numpy as np
 import pandas as pd
 
 import core
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 
 @dataclass(frozen=True)
 class Settings:

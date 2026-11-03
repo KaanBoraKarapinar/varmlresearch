@@ -28,8 +28,8 @@ import numpy as np
 import pandas as pd
 
 import core
-import garch_models as gm
-import tree_models as tm
+from core.models import garch_models as gm
+from core.models import tree_models as tm
 from core import (
     DailyGroundTruthCalendar,
     EwmaVarianceBank,
@@ -1251,7 +1251,7 @@ def reweight_blocker(run: Run) -> str | None:
     if not run.has_ewma_bank:
         return "it has no per-ticker forecasts (a wide model or the historical VaR)"
     if not run.has_first_window_training_bank:
-        return "its first-window training bank is not saved (run backfill_first_window_training_bank.py)"
+        return "its first-window training bank is not saved (run tools/backfill_first_window_training_bank.py)"
     recipe = run.recipe
     if recipe.model_family == "xgboost" and "MarketEwmaVol" in recipe.features.portfolio_dependent_blocks:
         return "its MarketEwmaVol feature is the portfolio's own ewma vol, so its forecasts depend on the weights"

@@ -1,10 +1,10 @@
 """
 Experiment: models trained ONCE on 23 tickers, applied to other calendars (other portfolios), against models trained on that portfolio itself.
 
-    python train_23_experiment.py
+    python training/train_23_experiment.py
 
 All walk-forwards: train 756 / forecast 21 from 2016-03-01 (the RV starts 2016-01-04), forecast days 2019-03-04 .. 2026-06-30.
-Needs data_general/23_ticker_data_2010_2026.csv (download_prices_yahoo.py), RV_sip_23tickers.csv (alpaca_calculate_rv.py), vix, sp500, us3m/5y/10y/30y.
+Needs data_general/23_ticker_data_2010_2026.csv (downloads/download_prices_yahoo.py), RV_sip_23tickers.csv (downloads/alpaca_calculate_rv.py), vix, sp500, us3m/5y/10y/30y.
 
 The features are PORTABLE (FeatureSpec.portable(): no MarketEwmaVol, which is the portfolio's own volatility), so a model trained on the 23 tickers
 can be applied to a calendar with another portfolio (ModelRecipe.pretrained_from, see walk_forward._check_pretrained).
@@ -16,6 +16,7 @@ can be applied to a calendar with another portfolio (ModelRecipe.pretrained_from
 The runs are saved in the run store (a saved run is reused: the script can be run again after an interruption) and logged to MLflow.
 """
 import dataclasses
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -23,14 +24,15 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import pandas as pd
 
 import core
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.feature_blocks import FeatureSpec, RvHar, Sp500Return, Vix, YieldSpread10y3m, YieldSpread10y5y, YieldSpread30y10y
 from core.targets import RealizedVariance, RelativeRvChange, SquaredReturn
 

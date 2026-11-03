@@ -1,9 +1,9 @@
 """
 Experiment: the realized-variance (RV) targets against the squared-return model, train 756 / forecast 21 from 2016-03.
 
-    python train_rv_experiment.py
+    python training/train_rv_experiment.py
 
-Needs data_general/RV_sip.csv (alpaca_calculate_rv.py). The RV starts 2016-01-04 and the windows read 30 warmup bars before
+Needs data_general/RV_sip.csv (downloads/alpaca_calculate_rv.py). The RV starts 2016-01-04 and the windows read 30 warmup bars before
 the first train bar, so the walk-forward starts on 2016-03-01.
 
 Runs: the baselines (garch_wide, ewma, historical), the squared-return and ratio models of the standard set, and three RV models:
@@ -11,6 +11,7 @@ Runs: the baselines (garch_wide, ewma, historical), the squared-return and ratio
     xgb_long_rv_har   + RvHar features (rv, rv_week, rv_month), target RealizedVariance
     xgb_long_drv_har  + RvHar features, target RelativeRvChange (dRV_rel_next = RV_next / RV - 1)
 """
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -18,14 +19,15 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import pandas as pd
 
 import core
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.feature_blocks import FeatureSpec, RvHar, TickerOneHot
 from core.targets import RatioToBase, RealizedVariance, RelativeRvChange, SquaredReturn
 

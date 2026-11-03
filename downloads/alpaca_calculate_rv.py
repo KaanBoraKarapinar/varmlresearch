@@ -5,9 +5,11 @@ Derived variables (RV_w, RV_m, dRV_rel_next) are NOT computed here.
 
 Setup:
     pip install alpaca-py pandas numpy python-dotenv
-    .env file next to this script:
+    .env file in the project root (it is not tracked by git):
         APCA_API_KEY_ID=...
         APCA_API_SECRET_KEY=...
+
+    python downloads/alpaca_calculate_rv.py        (the paths below are relative to the project root; the script moves there itself)
 """
 import os
 from datetime import datetime, timedelta
@@ -20,6 +22,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent.parent       # the project root: this script lives in downloads/
+os.chdir(ROOT)
 
 # ----------------------------- CONFIG -----------------------------
 UNIVERSES = {

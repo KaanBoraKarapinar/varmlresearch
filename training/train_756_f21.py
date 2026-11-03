@@ -1,10 +1,11 @@
 """
 Experiment: the seven standard runs on the walk-forward train 756 / forecast 21 (all data, from the first possible bar).
 
-    python train_756_f21.py
+    python training/train_756_f21.py
 
 Trains and saves the runs into the run store (a run that is already saved is reused) and logs them to MLflow.
 """
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -12,13 +13,14 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 import os
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent       # the project root: the scripts live one folder down
+sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import pandas as pd
 
-import run_store as rs
-import walk_forward as wf
+from core import run_store as rs
+from core import walk_forward as wf
 from core.feature_blocks import FeatureSpec, TickerOneHot
 from core.targets import RatioToBase, SquaredReturn
 
