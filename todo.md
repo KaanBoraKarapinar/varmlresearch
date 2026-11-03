@@ -1,1 +1,0 @@
-* exceedance tolerance siniri/ exceedance severity nasi
