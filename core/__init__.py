@@ -10,7 +10,7 @@ from .ResidualBank import ResidualBank, RESIDUAL_COLS, VARIANCE_FLOOR, DEFAULT_E
 from .EwmaVarianceBank import EwmaVarianceBank
 from .TrainedModel import TrainedModel
 # AbsReturn exists as a target and as a feature block: the blocks live in core.feature_blocks
-from .targets import Target, SquaredReturn, RatioToBase, LogVariance, AbsReturn, RealizedVariance, RelativeRvChange
+from .targets import Target, SquaredReturn, RatioToBase, LogVariance, AbsReturn, RealizedVariance, LogRealizedVariance, RelativeRvChange
 from .additional_feature_data import (
     AdditionalFeatureSource,
     check_additional_feature_data,

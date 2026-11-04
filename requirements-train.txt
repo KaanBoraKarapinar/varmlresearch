@@ -1,0 +1,10 @@
+# What the training scripts (training/train_horizon_grid.py and the ones it imports) need on a machine without the dashboard: the versions of the project's .venv.
+# Python 3.14. MLflow and the dashboard's packages (streamlit, plotly) are not needed to train: run with --no-mlflow and log the runs where the dashboard is (--log-only).
+arch==8.0.0
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+scikit-learn==1.9.1
+scipy==1.18.1
+statsmodels==0.15.0
+xgboost==3.4.1

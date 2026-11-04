@@ -46,6 +46,7 @@ from core import (
 )
 from core import feature_blocks, targets
 from core.ResidualBank import RESIDUAL_COLS
+from core.virtual_runs import portfolio_id, read_residuals
 from core.feature_blocks import Returns
 from core.units import return_to_percent
 
@@ -165,9 +166,13 @@ class WalkForwardSetting:
             for window_id, (train_start_pos, train_end_pos, forecast_end_pos) in enumerate(self._positions())
         ])
 
-    def make_calendars(self) -> list[DailyGroundTruthCalendar]:
-        """One DailyGroundTruthCalendar per window, in time order (list position = window id)."""
+    def make_calendars(self, window_ids: list[int] | None = None) -> list[DailyGroundTruthCalendar]:
+        """
+        One DailyGroundTruthCalendar per window, in time order (list position = window id).
+        window_ids: only these windows, in this order (a 1-day forecast has thousands of windows, and a worker needs a few at a time).
+        """
         index = self._index
+        positions = self._positions() if window_ids is None else [self._positions()[i] for i in window_ids]
         return [
             DailyGroundTruthCalendar(
                 self.tickers_raw_price_data, self.tickers, self.weights,
@@ -176,7 +181,7 @@ class WalkForwardSetting:
                 unit=self.unit, warmup_bars=self.warmup_bars, drop_market_closed=self.drop_market_closed,
                 additional_feature_data=self.additional_feature_data,
             )
-            for train_start_pos, train_end_pos, forecast_end_pos in self._positions()
+            for train_start_pos, train_end_pos, forecast_end_pos in positions
         ]
 
     @cached_property
@@ -305,6 +310,7 @@ class WalkForwardSingleCalendarFit:
     residual_bank: ResidualBank
     ewma_bank: EwmaVarianceBank | None = None  # long format only
     forecast_feature: object | None = None  # the forecast-side features (None for the 'ewma' family)
+    window_loss_row: dict | None = None  # window_loss_row(fit), kept by a slim fit (slim_fit) that no longer has the features it is made from
 
 
 def _check_pretrained(calendars: list[DailyGroundTruthCalendar], recipe: ModelRecipe, pretrained: "LoadedRun") -> None:
@@ -364,6 +370,100 @@ def train_walk_forward(
                    None if pretrained is None else trained_columns)
         for window_id, calendar in enumerate(calendars)
     ]
+
+
+@dataclass(frozen=True)
+class SlimCalendar:
+    """What the writers of a slim run read of a window's calendar: its last train day, its forecast days with their realized loss, and the unit."""
+    train_end: pd.Timestamp
+    forecast_dates: pd.DatetimeIndex
+    forecast_data: pd.DataFrame     # only the portfolio_loss column
+    unit: str
+
+
+def slim_fit(fit: WalkForwardSingleCalendarFit, keep_training_bank: bool) -> WalkForwardSingleCalendarFit:
+    """
+    The fit reduced to what save_walk_forward_run(slim=True) reads, so that thousands of windows (a 1-day forecast) fit in memory at once: the window's loss row is made
+    first (it needs the features), then the features, the calendar's frames, the in-sample banks of the model and, in the ewma bank, everything but the forecast days go.
+    keep_training_bank: window 0, whose training days build the first-window training bank. What is kept is the same numbers as before: a slim run saved from slim fits
+    equals the slim run saved from the full fits (tests/ checks it file by file).
+    """
+    row = window_loss_row(fit)
+    calendar = SlimCalendar(fit.calendar.train_end, fit.calendar.forecast_dates, fit.calendar.forecast_data[["portfolio_loss"]].copy(), fit.calendar.unit)
+    model = fit.trained_model
+    if model is not None:
+        model = copy.copy(model)
+        model.training_feature = None
+        model.residual_bank_in_sample = None
+        model.ewma_variance_bank_in_sample = None
+    residual_bank = copy.copy(fit.residual_bank)
+    residual_bank.residuals = residual_bank.residuals.copy()
+    residual_bank.residuals[RESIDUAL_COLS] = residual_bank.residuals[RESIDUAL_COLS].astype(float)       # the bank's frame starts as object columns: floats are what is written
+    ewma_bank = fit.ewma_bank
+    if ewma_bank is not None:
+        ewma_bank = copy.copy(ewma_bank)
+        if not keep_training_bank:
+            dates = calendar.forecast_dates
+            ewma_bank.cov_by_date = {date: ewma_bank.cov_by_date[date] for date in dates}
+            ewma_bank.portfolio_variance = ewma_bank.portfolio_variance.loc[dates]
+            ewma_bank.sigma_diag = ewma_bank.sigma_diag.loc[dates]
+            ewma_bank.ticker_returns = ewma_bank.ticker_returns.loc[dates]
+    return dataclasses.replace(
+        fit, calendar=calendar, trained_model=model, residual_bank=residual_bank, ewma_bank=ewma_bank, forecast_feature=None, window_loss_row=row,
+    )
+
+
+_SLIM_WORKER: dict = {}      # the setting and the recipe of the process that fits windows (set once by _start_slim_worker)
+
+
+def _start_slim_worker(setting: "WalkForwardSetting", recipe: ModelRecipe, one_thread: bool = False) -> None:
+    if one_thread:      # the workers are the parallelism: a worker that also spread a fit over every core would fight the others for them
+        import os
+        os.environ["OMP_NUM_THREADS"] = "1"
+    _SLIM_WORKER["setting"], _SLIM_WORKER["recipe"] = setting, recipe
+
+
+def _fit_slim_chunk(window_ids: list[int]) -> list[WalkForwardSingleCalendarFit]:
+    import contextlib
+    import io
+
+    setting, recipe = _SLIM_WORKER["setting"], _SLIM_WORKER["recipe"]
+    with contextlib.redirect_stdout(io.StringIO()):     # a calendar prints notes about its weekdays and holidays: thousands of windows would bury everything else in the log
+        calendars = setting.make_calendars(window_ids)      # only this chunk's calendars exist at a time
+        return [slim_fit(fit_window(window_id, calendar, recipe), keep_training_bank=window_id == 0) for window_id, calendar in zip(window_ids, calendars)]
+
+
+def train_walk_forward_slim(
+    setting: "WalkForwardSetting", recipe: ModelRecipe, workers: int = 1, chunk: int = 25, progress=None,
+) -> list[WalkForwardSingleCalendarFit]:
+    """
+    train_walk_forward for a run that is saved slim: the windows are fitted `chunk` at a time, each reduced by slim_fit as it is made, so the memory is the slim fits (and
+    one chunk of full ones) instead of every full fit: a 1-day forecast has about 2000 windows of 4-15 MB. The windows are independent, so `workers` processes (spawned,
+    one thread each) fit chunks at the same time; workers=1 does the chunks one after the other in this process. The result is the list of slim fits in window order.
+    progress(windows_done, n_windows): called each time the next chunk (in window order) is ready, so that a long training can be followed; None: not called.
+    """
+    if recipe.pretrained_from is not None:
+        raise ValueError("train_walk_forward_slim does not apply a pretrained run: use train_walk_forward.")
+    n_windows = len(setting.window_table())
+    chunks = [list(range(start, min(start + chunk, n_windows))) for start in range(0, n_windows, chunk)]
+    fits: list[WalkForwardSingleCalendarFit] = []
+
+    def collect(part: list[WalkForwardSingleCalendarFit]) -> None:
+        fits.extend(part)
+        if progress is not None:
+            progress(len(fits), n_windows)
+
+    if workers == 1:
+        _start_slim_worker(setting, recipe)
+        for ids in chunks:
+            collect(_fit_slim_chunk(ids))
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"), initializer=_start_slim_worker, initargs=(setting, recipe, True)) as pool:
+            for part in pool.map(_fit_slim_chunk, chunks):      # the chunks come back in order, as they are ready
+                collect(part)
+    return fits
 
 
 def fit_window(
@@ -672,31 +772,34 @@ def window_losses(fits: list[WalkForwardSingleCalendarFit]) -> pd.DataFrame:
                                      only comparable between models with the same target and scale; days = *_loss_days
     The in-sample rows are the training days of the window's bank (the same rolling windows overlap: a day is in many windows).
     """
-    rows = {}
-    for fit in fits:
-        residuals = fit.residual_bank.residuals[["actual_return", "predicted_variance"]].astype(float)
-        # the realized return as a percent return, so a log run and a percent run are scored against the same r^2
-        residuals["actual_return"] = return_to_percent(residuals["actual_return"], fit.calendar.unit)
-        is_forecast = residuals.index.isin(fit.calendar.forecast_dates)
-        row = {}
-        has_variance_forecast = fit.trained_model is not None or fit.ewma_bank is not None     # the historical family has none
-        for part, mask in (("train", ~is_forecast), ("forecast", is_forecast)):
-            part_rows = residuals[mask]
-            row[f"{part}_days"] = len(part_rows)
-            row[f"{part}_qlike"] = (
-                qlike(part_rows["predicted_variance"], part_rows["actual_return"] ** 2) if has_variance_forecast else np.nan
-            )
-        row.update(train_loss=np.nan, train_loss_days=0, forecast_loss=np.nan, forecast_loss_days=0)
-        if isinstance(fit.trained_model, tm.TrainedTreeModel):
-            tf, ff = fit.trained_model.training_feature, fit.forecast_feature
-            train_dates = tf.X_in_sample.index if tf.X_in_sample_id_cols is None else tf.X_in_sample_id_cols["Date"]
-            forecast_dates = ff.X_forecast_sample.index if ff.id_cols is None else ff.id_cols["Date"]
-            row["train_loss"], row["train_loss_days"] = _target_unit_mse(
-                fit.trained_model, tf.X_in_sample, tf.y_in_sample["target"], train_dates)
-            row["forecast_loss"], row["forecast_loss_days"] = _target_unit_mse(
-                fit.trained_model, ff.X_forecast_sample, ff.y_forecast_sample["target"], forecast_dates)
-        rows[fit.window_id] = row
+    rows = {fit.window_id: fit.window_loss_row if fit.window_loss_row is not None else window_loss_row(fit) for fit in fits}
     return pd.DataFrame(rows).T.rename_axis("window_id")
+
+
+def window_loss_row(fit: WalkForwardSingleCalendarFit) -> dict:
+    """One row of window_losses: the losses of one window (a slim fit carries this row, made while it still had its features)."""
+    residuals = fit.residual_bank.residuals[["actual_return", "predicted_variance"]].astype(float)
+    # the realized return as a percent return, so a log run and a percent run are scored against the same r^2
+    residuals["actual_return"] = return_to_percent(residuals["actual_return"], fit.calendar.unit)
+    is_forecast = residuals.index.isin(fit.calendar.forecast_dates)
+    row = {}
+    has_variance_forecast = fit.trained_model is not None or fit.ewma_bank is not None     # the historical family has none
+    for part, mask in (("train", ~is_forecast), ("forecast", is_forecast)):
+        part_rows = residuals[mask]
+        row[f"{part}_days"] = len(part_rows)
+        row[f"{part}_qlike"] = (
+            qlike(part_rows["predicted_variance"], part_rows["actual_return"] ** 2) if has_variance_forecast else np.nan
+        )
+    row.update(train_loss=np.nan, train_loss_days=0, forecast_loss=np.nan, forecast_loss_days=0)
+    if isinstance(fit.trained_model, tm.TrainedTreeModel):
+        tf, ff = fit.trained_model.training_feature, fit.forecast_feature
+        train_dates = tf.X_in_sample.index if tf.X_in_sample_id_cols is None else tf.X_in_sample_id_cols["Date"]
+        forecast_dates = ff.X_forecast_sample.index if ff.id_cols is None else ff.id_cols["Date"]
+        row["train_loss"], row["train_loss_days"] = _target_unit_mse(
+            fit.trained_model, tf.X_in_sample, tf.y_in_sample["target"], train_dates)
+        row["forecast_loss"], row["forecast_loss_days"] = _target_unit_mse(
+            fit.trained_model, ff.X_forecast_sample, ff.y_forecast_sample["target"], forecast_dates)
+    return row
 
 
 def total_window_losses(table: pd.DataFrame) -> dict[str, float]:
@@ -871,6 +974,8 @@ class Run(ABC):
       LoadedRun               the sources are the files of a saved run folder (run_store.load_walk_forward_run)
       TrainedInitialRun       the sources are the fits of a training that has not been saved
       ReweightedVirtualRun    another run's per-ticker forecasts read for other portfolio weights: nothing is trained, nothing is saved
+      StoredVirtualRun        a ReweightedVirtualRun whose residuals were saved under VirtualRuns/ and are read from there
+      StoredBaselineRun       a baseline trained for a portfolio's weights, kept under VirtualRuns/ as its residuals only
     """
 
     # ---- the sources ----------------------------------------------------------------------------
@@ -1258,15 +1363,24 @@ def reweight_blocker(run: Run) -> str | None:
     return None
 
 
+def _label_with_portfolio(run_name: str, display_name: str, portfolio_name: str) -> str:
+    """'<run name> | train N f M' -> '<run name> | <portfolio name> | train N f M' (the portfolio goes right after the model)."""
+    if not display_name.startswith(run_name + " | "):
+        return f"{display_name} | {portfolio_name}"
+    return f"{run_name} | {portfolio_name}{display_name[len(run_name):]}"
+
+
 class ReweightedVirtualRun(Run):
     """
     Another run's per-ticker forecasts read for OTHER portfolio weights: Sigma_t = D R D of the stored rows, the residuals, the quantile
     and the loss are recomputed with the weights given (reweighted_residuals). Nothing is trained and nothing is saved.
     Exact for GARCH, EWMA and the xgboost models with portable features; reweight_blocker says when it is not.
     base: any Run with an ewma bank. weights: ticker -> weight for exactly the base's tickers, normalised here.
+    portfolio: the portfolio's record (core.portfolios: portfolio_id, name, tags ...). With it the label is
+    '<model> | <portfolio name> | train N f M', without it '<base label> | user defined weights'.
     """
 
-    def __init__(self, base: Run, weights: dict[str, float]):
+    def __init__(self, base: Run, weights: dict[str, float], portfolio: dict | None = None):
         blocker = reweight_blocker(base)
         if blocker:
             raise ValueError(f"{base.display_name} cannot be re-weighted: {blocker}.")
@@ -1277,14 +1391,19 @@ class ReweightedVirtualRun(Run):
         if (w < 0).any() or w.sum() <= 0:
             raise ValueError("weights must be non-negative with a positive sum.")
         self.base, self.tickers, self.weights = base, tickers, w / w.sum()
+        self.portfolio = portfolio
 
     @cached_property
     def config(self) -> dict:
         config = copy.deepcopy(self.base.config)
         config["setting"]["weights"] = {t: float(w) for t, w in zip(self.tickers, self.weights)}
-        digest = hashlib.sha256(json.dumps({t: round(float(w), 12) for t, w in zip(self.tickers, self.weights)}, sort_keys=True).encode()).hexdigest()[:8]
+        digest = portfolio_id(dict(zip(self.tickers, self.weights)))
         config["run_id"] = f"{self.base.run_id}@{digest}"
-        config["display_name"] = f"{self.base.display_name} | user defined weights"
+        if self.portfolio is None:
+            config["display_name"] = f"{self.base.display_name} | user defined weights"
+        else:
+            config["display_name"] = _label_with_portfolio(self.base.name, self.base.display_name, self.portfolio["name"])
+            config["portfolio"] = {k: self.portfolio[k] for k in ("portfolio_id", "name", "tags")}
         config["reweighted_from"] = self.base.run_id
         return config
 
@@ -1342,3 +1461,77 @@ class ReweightedVirtualRun(Run):
     @cached_property
     def first_window_training_bank(self) -> pd.DataFrame:
         return self._with_portfolio_variance(self.base.first_window_training_bank)
+
+
+class StoredVirtualRun(ReweightedVirtualRun):
+    """
+    A ReweightedVirtualRun whose combined residuals were saved (run_store.save_virtual_run, core.virtual_runs) and are read back from
+    VirtualRuns/ instead of being rebuilt from the base run's banks: a reading needs only those residuals, so the base's (large) ewma bank
+    is opened only by the views that explain a day (ewma_bank, first_window_training_bank). Everything else is the ReweightedVirtualRun's.
+    """
+
+    def __init__(self, base: Run, weights: dict[str, float], root: Path, portfolio: dict | None = None):
+        super().__init__(base, weights, portfolio)
+        self.root = Path(root)
+
+    @cached_property
+    def combined_residuals(self) -> pd.DataFrame:
+        return read_residuals(
+            self.root, self.base.walk_forward_id, self.base.name, portfolio_id(dict(zip(self.tickers, self.weights))),
+        )
+
+
+class StoredBaselineRun(Run):
+    """
+    A baseline (GARCH, historical) trained for the weights of a portfolio and kept as its combined residuals only
+    (run_store.save_baseline_runs): it depends on the portfolio's own return, so it cannot be read off another run, and nothing of the model
+    is kept. Every reading is derived from the residuals, like any run's. It has no ewma bank (wide models do not) and the in-sample QLIKE of
+    its windows is NaN (only the first window's training days are kept): the QLIKE of the forecast days is rebuilt from the residuals.
+    config is the model_settings the training gave it (run_id <walk_forward>/none/<model dir>@<portfolio_id>, label '<model> | <portfolio> | train N f M').
+    """
+
+    def __init__(self, config: dict, windows: pd.DataFrame, root: Path, model: str):
+        self._config, self._windows, self.root, self.model = config, windows, Path(root), model
+
+    @property
+    def config(self) -> dict:
+        return self._config
+
+    @property
+    def windows(self) -> pd.DataFrame:
+        return self._windows
+
+    @cached_property
+    def combined_residuals(self) -> pd.DataFrame:
+        return read_residuals(self.root, self.walk_forward_id, self.model, self.config["portfolio"]["portfolio_id"])
+
+    @cached_property
+    def window_losses(self) -> pd.DataFrame:
+        residuals = self.combined_residuals
+        forecast = residuals[residuals["part"] == "forecast"]
+        r2 = return_to_percent(forecast["actual_return"], self.unit) ** 2
+        has_variance_forecast = self.params["model_family"] != "historical"      # the historical family has none, as in window_losses
+        rows = {}
+        for window_id, part in forecast.groupby("window_id"):
+            rows[window_id] = {
+                "train_days": 0, "train_qlike": np.nan, "forecast_days": len(part),
+                "forecast_qlike": qlike(part["predicted_variance"], r2.loc[part.index]) if has_variance_forecast else np.nan,
+                "train_loss": np.nan, "train_loss_days": 0, "forecast_loss": np.nan, "forecast_loss_days": 0,
+            }
+        return pd.DataFrame(rows).T.rename_axis("window_id")
+
+    @property
+    def has_ewma_bank(self) -> bool:
+        return False
+
+    @property
+    def ewma_bank(self) -> pd.DataFrame:
+        raise FileNotFoundError(f"{self.display_name} has no ewma bank (not a long / ewma run).")
+
+    @property
+    def has_first_window_training_bank(self) -> bool:
+        return False
+
+    @property
+    def first_window_training_bank(self) -> pd.DataFrame:
+        raise FileNotFoundError(f"{self.display_name} has no first-window training bank (not a long / ewma run).")

@@ -25,6 +25,8 @@ read off the combined residuals (it is an argument of the evaluation, not part o
 
     train_and_save_walk_forward_run(setting, recipe, name)   train + save (or reuse an identical run)
     load_walk_forward_run(run_id)                            -> LoadedRun
+    save_virtual_run(virtual) / save_baseline_runs(setting, weights)   a portfolio's runs kept under <walk_forward>/VirtualRuns/ (residuals only)
+    load_virtual_run(run_id)                                 -> StoredVirtualRun | StoredBaselineRun
     trained_initial_run(setting, recipe, fits, name)         -> TrainedInitialRun (a training that is not saved)
     runs_table / load_runs                                   select runs by params
     leaderboard / common_dates / factor_table / window_matrix / explain_window / explain_day / exceedance_days
@@ -33,10 +35,12 @@ read off the combined residuals (it is an argument of the evaluation, not part o
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import hashlib
 import importlib.metadata
+import io
 import json
 import shutil
 import subprocess
@@ -49,6 +53,8 @@ import core
 from core import EwmaVarianceBank
 from core import walk_forward as wf
 from core.ResidualBank import RESIDUAL_COLS
+from core import portfolios
+from core import virtual_runs as vr
 # the run read back from disk is walk_forward.LoadedRun; run_store keeps the layout on disk, the saving and the views over runs
 from core.walk_forward import (
     LoadedRun, Reading, Run, _calendar_name, _json_default, _parquet_metadata, _read_json, _to_parquet, _write_json,
@@ -394,11 +400,15 @@ def save_walk_forward_run(
 
 def train_and_save_walk_forward_run(
     setting: wf.WalkForwardSetting, recipe: wf.ModelRecipe, name: str | None = None, root: Path = STORE_ROOT, slim: bool = False,
+    workers: int | None = None, progress=None,
 ) -> LoadedRun:
     """
     Train the recipe on the walk-forward and save it. The recipe decides the folder (feature+target key, model key),
     `name` is its label. The same recipe is reused (nothing is trained); the same name for another recipe, or another
     name for a saved recipe, raises: a name never silently changes meaning. slim: see save_walk_forward_run.
+    workers (needs slim): fit the windows `workers` processes at a time, each window reduced (wf.slim_fit) as it is made, so a walk-forward with thousands of windows (a
+    1-day forecast) fits in memory; the run saved is the one slim=True saves without workers. None: the windows are fitted one after the other, all kept in full.
+    progress(windows_done, n_windows): called while the windows are fitted (with workers), to follow a long training.
     """
     name = name or _default_run_name(recipe)
     if "/" in name:
@@ -413,7 +423,12 @@ def train_and_save_walk_forward_run(
         if stored["run_id"] == run_id:
             return load_walk_forward_run(run_id, root)
     pretrained = None if recipe.pretrained_from is None else load_walk_forward_run(recipe.pretrained_from, root)
-    fits = wf.train_walk_forward(setting.make_calendars(), recipe, pretrained)
+    if workers is not None:
+        if not slim:
+            raise ValueError("workers needs slim=True: the windows are reduced to what a slim run keeps as they are made.")
+        fits = wf.train_walk_forward_slim(setting, recipe, workers, progress=progress)
+    else:
+        fits = wf.train_walk_forward(setting.make_calendars(), recipe, pretrained)
     save_walk_forward_run(setting, recipe, fits, name, root, slim)
     return load_walk_forward_run(run_id, root)
 
@@ -425,6 +440,161 @@ def load_walk_forward_run(run_id: str, root: Path = STORE_ROOT) -> LoadedRun:
     if not (run_dir / "model_settings.json").exists():
         raise FileNotFoundError(f"no run {run_id} under {root}")
     return LoadedRun(run_dir)
+
+
+def save_virtual_run(
+    virtual: wf.ReweightedVirtualRun, root: Path = STORE_ROOT, batch: dict | None = None,
+    name: str | None = None, tags: dict | None = None, name_prefix: str | None = None,
+) -> str:
+    """
+    Keep a ReweightedVirtualRun: its combined residuals go to <walk_forward>/VirtualRuns/ (core.virtual_runs), with the weights and the run
+    it was read from, so load_virtual_run opens it later with any VaR reading. The portfolio is registered (core.portfolios) under `name`
+    (None: described by its weights, after `name_prefix`) with its `tags`, and the run is linked to it; the registry is checked first, so a
+    name that is taken writes nothing.
+    A portfolio of a base run is kept once: saving it again changes nothing. batch: free provenance for the ledger.
+    Returns the run_id (<base run_id>@<portfolio_id>).
+    """
+    weights = {ticker: float(w) for ticker, w in zip(virtual.tickers, virtual.weights)}
+    portfolios.register_portfolio(root, weights, name, tags, name_prefix)
+    return save_virtual_runs([virtual], root, batch)[0]
+
+
+def _ledger_config(config: dict) -> dict:
+    """
+    A run's model_settings for the ledger: JSON values, without the git diff of the code (it is the size of the working tree's uncommitted changes,
+    ~100 KB in every ledger line); the commit and whether the tree was dirty stay.
+    """
+    config = json.loads(json.dumps(config, default=_json_default))
+    if "code" in config:
+        config["code"] = {k: v for k, v in config["code"].items() if k != "diff"}
+    return config
+
+
+def save_virtual_runs(virtuals: list[wf.ReweightedVirtualRun], root: Path = STORE_ROOT, batch: dict | None = None) -> list[str]:
+    """
+    Keep the virtual runs of SEVERAL portfolios at once: the portfolios of one base run go into ONE new part file (not a file per portfolio), which
+    is what keeps a few hundred portfolios at a few files per model. The portfolios have to be registered already (save_virtual_run registers one; the
+    label of a run carries the registered name). A run that is already kept is not written again. Returns the run_ids in the order given.
+    """
+    groups: dict[tuple[str, str], list[wf.ReweightedVirtualRun]] = {}
+    for virtual in virtuals:
+        groups.setdefault((virtual.base.walk_forward_id, virtual.base.name), []).append(virtual)
+    records = portfolios.portfolios_by_id(root)
+    links = []
+    for (walk_forward_id, model), members in groups.items():
+        kept = set(vr.portfolio_ids(root, walk_forward_id, model))
+        frames, definitions = {}, {}
+        for virtual in members:
+            weights = {ticker: float(w) for ticker, w in zip(virtual.tickers, virtual.weights)}
+            portfolio = vr.portfolio_id(weights)
+            if portfolio not in records:
+                raise KeyError(f"portfolio {portfolio} is not registered: register it first (core.portfolios.register_portfolio).")
+            links.append((portfolio, virtual.run_id, "reweighted"))
+            if portfolio in kept or portfolio in frames:
+                continue
+            labelled = wf.ReweightedVirtualRun(virtual.base, weights, records[portfolio])      # the run as the dashboard lists it: its label carries the portfolio name
+            frames[portfolio] = virtual.combined_residuals
+            definitions[portfolio] = {
+                "kind": "reweighted", "run_id": virtual.run_id, "weights": weights, "base_run_id": virtual.base.run_id,
+                "config": _ledger_config(labelled.config),
+            }
+        if frames:
+            vr.save_residuals(root, walk_forward_id, model, frames, batch=batch, definitions=definitions)
+    portfolios.link_runs(root, links)
+    return [virtual.run_id for virtual in virtuals]
+
+
+def save_baseline_runs(
+    base_setting: wf.WalkForwardSetting, weights: dict[str, float], root: Path = STORE_ROOT,
+    names: tuple[str, ...] = ("garch_wide", "historical"), name: str | None = None, tags: dict | None = None,
+    name_prefix: str | None = None, batch: dict | None = None,
+) -> dict[str, str]:
+    """
+    Train baselines (wf.BASELINE_RECIPES) for ONE portfolio: base_setting with these weights, its windows and data. They depend on the portfolio's own
+    return, so they are trained again for every portfolio, and only their combined residuals are kept, under the BASE walk-forward's VirtualRuns/
+    (core.virtual_runs): no folder per portfolio, no per-window files. The recipes are kept once as VirtualRuns/BaselineModelDefs/<name>.json and the
+    complete model_settings of each run in the ledger, so a run can be read, listed and, if wanted, trained again as a full run.
+    A baseline already kept for the portfolio is not trained again. Returns {run name: run_id}, run_id = <base walk-forward>/<ft key>/<model dir>@<portfolio_id>.
+    """
+    record = portfolios.register_portfolio(root, weights, name, tags, name_prefix)
+    return save_baseline_runs_for(base_setting, [record], root, names, batch)[record["portfolio_id"]]
+
+
+def save_baseline_runs_for(
+    base_setting: wf.WalkForwardSetting, records: list[dict], root: Path = STORE_ROOT,
+    names: tuple[str, ...] = ("garch_wide", "historical"), batch: dict | None = None,
+) -> dict[str, dict[str, str]]:
+    """
+    save_baseline_runs for SEVERAL registered portfolios (records: their registry records, core.portfolios): each baseline is trained for every portfolio
+    that does not have it yet and the residuals of ALL of them are written together, ONE new part file per baseline, so a few hundred portfolios stay
+    at a few files per baseline. Nothing is written until the baselines of every portfolio are trained: the number of portfolios per call is the
+    size of what an interruption loses. Returns {portfolio_id: {run name: run_id}}.
+    """
+    unknown = [n for n in names if n not in wf.BASELINE_RECIPES]
+    if unknown:
+        raise ValueError(f"unknown baselines {unknown}; known: {list(wf.BASELINE_RECIPES)}.")
+    base_id = base_setting.walk_forward_id
+    save_walk_forward(base_setting, root)               # the walk-forward folder with its windows (an existing one must hold the same inputs)
+    run_ids = {
+        record["portfolio_id"]: {
+            n: f"{base_id}/{_feature_target_key(wf.BASELINE_RECIPES[n])}/{_model_dir_name(wf.BASELINE_RECIPES[n])}@{record['portfolio_id']}" for n in names
+        } for record in records
+    }
+    kept = {n: set(vr.portfolio_ids(root, base_id, n)) for n in names}
+    frames: dict[str, dict] = {n: {} for n in names}
+    definitions: dict[str, dict] = {n: {} for n in names}
+    for record in records:
+        portfolio = record["portfolio_id"]
+        todo = [n for n in names if portfolio not in kept[n]]
+        if not todo:
+            continue
+        setting = dataclasses.replace(base_setting, weights={t: float(record["weights"][t]) for t in base_setting.tickers})
+        with contextlib.redirect_stdout(io.StringIO()):      # the calendars print a line for every market holiday they skip
+            calendars = setting.make_calendars()
+        for run_name in todo:
+            recipe = wf.BASELINE_RECIPES[run_name]
+            with contextlib.redirect_stdout(io.StringIO()):
+                fits = wf.train_walk_forward(calendars, recipe)
+            config = _model_settings(setting, recipe, run_name, fits)
+            config["trained_on_walk_forward_id"] = config["walk_forward_id"]        # the id a full run for these weights would get
+            config["walk_forward_id"] = config["keys"]["walk_forward_id"] = base_id
+            config["run_id"] = run_ids[portfolio][run_name]
+            config["display_name"] = wf._label_with_portfolio(run_name, config["display_name"], record["name"])
+            config["portfolio"] = {k: record[k] for k in ("portfolio_id", "name", "tags")}
+            frames[run_name][portfolio] = wf.build_combined_residuals_frame(fits)
+            definitions[run_name][portfolio] = {
+                "kind": "trained_baseline", "run_id": run_ids[portfolio][run_name], "weights": record["weights"],
+                "recipe_key": _model_key(recipe), "config": _ledger_config(config),
+            }
+    for run_name in names:
+        if not frames[run_name]:
+            continue
+        recipe = wf.BASELINE_RECIPES[run_name]
+        vr.ensure_model_definition(root, base_id, run_name, {
+            "run_name": run_name, "recipe": config_to_dict(recipe), "recipe_key": _model_key(recipe), "versions": _versions(),
+        })
+        vr.save_residuals(root, base_id, run_name, frames[run_name], batch=batch, definitions=definitions[run_name])
+    portfolios.link_runs(root, [(portfolio, run_id, "trained") for portfolio, by_name in run_ids.items() for run_id in by_name.values()])
+    return run_ids
+
+
+def load_virtual_run(run_id: str, root: Path = STORE_ROOT) -> wf.Run:
+    """
+    A run kept under VirtualRuns/ (run_id = <walk_forward>/<ft key>/<model dir>@<portfolio_id>): a StoredVirtualRun (another run's per-ticker
+    forecasts read for the portfolio's weights, save_virtual_run) or a StoredBaselineRun (a baseline trained for the weights, save_baseline_runs).
+    """
+    _, separator, portfolio = run_id.rpartition("@")
+    if not separator or not portfolio:
+        raise ValueError(f"{run_id!r} is not a virtual run id (<base run_id>@<portfolio_id>).")
+    try:
+        definition = vr.find_definition(root, run_id.split("/")[0], run_id)
+    except KeyError:
+        raise FileNotFoundError(f"no saved virtual run {run_id} under {root}") from None
+    if definition.get("kind") == "trained_baseline":
+        windows = pd.read_parquet(walk_forward_dir(run_id.split("/")[0], root) / "WindowsCreatedCalendars.parquet")
+        return wf.StoredBaselineRun(definition["config"], windows, root, definition["model"])
+    base = load_walk_forward_run(definition["base_run_id"], root)
+    return wf.StoredVirtualRun(base, definition["weights"], root, portfolios.get_portfolio(root, portfolio))
 
 
 # --------------------------------------------------------------------------------------------------

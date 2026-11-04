@@ -8,7 +8,7 @@ tick loss alone:
     2. significance the Model Confidence Set (Hansen, Lunde, Nason 2011; arch.bootstrap.MCS): the runs that cannot be told
                     apart from the best one at level alpha. It corrects for comparing many runs at once and for the days being
                     dependent (block bootstrap)
-    3. consistency  the common days are cut into blocks (default 252 days): how many blocks each run wins and its mean rank
+    3. consistency  the common days are cut into calendar years: in how many years each run wins and its mean rank
     + the pairwise matrix: row vs column, mean tick-loss difference and the Diebold-Mariano p-value (HAC standard error)
       with a Holm correction for the number of pairs
 
@@ -163,14 +163,13 @@ def model_confidence_set(losses: pd.DataFrame, alpha: float = 0.10, reps: int = 
     }, index=losses.columns)
 
 
-def block_ranking(losses: pd.DataFrame, block_days: int = 252) -> pd.DataFrame:
+def block_ranking(losses: pd.DataFrame) -> pd.DataFrame:
     """
-    The common days cut into consecutive blocks of `block_days` days (the last one may be shorter): the mean tick loss of
-    every run per block, then blocks_won (lowest in the block) and mean_block_rank (1 = best). Does not depend on the
-    runs' own windows, so runs of different walk-forwards are comparable.
+    The common days cut into calendar years (the first and the last year may be partial): the mean tick loss of every run
+    per year, then blocks_won (lowest in the year) and mean_block_rank (1 = best). Does not depend on the runs' own
+    windows, so runs of different walk-forwards are comparable.
     """
-    block = np.arange(len(losses)) // block_days
-    per_block = losses.groupby(block).mean()
+    per_block = losses.groupby(losses.index.year).mean()
     ranks = per_block.rank(axis=1)
     return pd.DataFrame({
         "blocks_won": per_block.eq(per_block.min(axis=1), axis=0).sum().astype(int),
@@ -181,12 +180,12 @@ def block_ranking(losses: pd.DataFrame, block_days: int = 252) -> pd.DataFrame:
 
 def select_best_run(
     var_dfs: dict[str, pd.DataFrame], var_confidence: float, test_confidence: float = 0.95,
-    baseline: str | None = None, alpha: float = 0.10, block_days: int = 252, reps: int = 1000, hac_lags: int = 5,
+    baseline: str | None = None, alpha: float = 0.10, reps: int = 1000, hac_lags: int = 5,
 ) -> RunSelection:
     """
     The runs ranked, with everything the choice rests on. Leaderboard columns:
       mean_tick_loss, valid (Kupiec + both Christoffersen pass), exceedance_rate, in_mcs / mcs_p_value (Model Confidence
-      Set at `alpha`), blocks_won / mean_block_rank (consistency over blocks of `block_days` days),
+      Set at `alpha`), blocks_won / mean_block_rank (consistency over the calendar years),
       dm_p_vs_baseline (Diebold-Mariano p-value against `baseline`, if given), verdict:
         'best'        the valid run of the set with the lowest tick loss
         'best set'    valid and not significantly worse than the best
@@ -205,7 +204,7 @@ def select_best_run(
         "exceedance_rate": pd.Series({n: float(t["exceedance_rate"]) for n, t in tests.items()}),
     })
     mcs = model_confidence_set(losses, alpha, reps)
-    leaderboard = leaderboard.join(mcs.rename(columns={"p_value": "mcs_p_value", "in_set": "in_mcs"})).join(block_ranking(losses, block_days))
+    leaderboard = leaderboard.join(mcs.rename(columns={"p_value": "mcs_p_value", "in_set": "in_mcs"})).join(block_ranking(losses))
     if baseline is not None:
         leaderboard["dm_p_vs_baseline"] = {
             name: (float("nan") if name == baseline else _dm_p_value((losses[name] - losses[baseline]).to_numpy(), hac_lags))

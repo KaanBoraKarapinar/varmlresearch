@@ -283,6 +283,23 @@ class RvHar(AdditionalFeatureBlock):
 
 
 @dataclass(frozen=True)
+class LogRvHar(AdditionalFeatureBlock):
+    """
+    The HAR regressors of RvHar in logs: `log_rv` (the log of the day's realized variance), `log_rv_week` and `log_rv_month` (the logs of its mean over the last `week` / `month`
+    days). With the target LogRealizedVariance a linear model on these is the log-HAR-RV of Corsi (2009), whose forecast exp(prediction) is always positive (a linear HAR in
+    levels can forecast a negative variance after a spike, which the variance floor turns into a standardized residual of 1e6).
+    """
+    tags: ClassVar[tuple] = ("rv",)
+    scope: ClassVar[str] = "tickers"
+    week: int = 5
+    month: int = 22
+
+    def features(self, values):
+        rv = values["rv"]
+        return [("log_rv", np.log(rv)), ("log_rv_week", np.log(rv.rolling(self.week).mean())), ("log_rv_month", np.log(rv.rolling(self.month).mean()))]
+
+
+@dataclass(frozen=True)
 class RvLags(AdditionalFeatureBlock):
     """
     The realized variance of each ticker n bars earlier (additional data tag 'rv'): `rv_lag_<n>` for every n in `lags`

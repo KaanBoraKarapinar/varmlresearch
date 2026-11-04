@@ -60,21 +60,36 @@ def var_curves_figure(var_dfs: dict[str, pd.DataFrame], title: str) -> go.Figure
     return _layout(fig, title, "VaR / loss")
 
 
-def pairwise_matrix_figure(pairwise) -> go.Figure:
+def loss_histogram_figure(loss: pd.Series, band: float, title: str) -> go.Figure:
+    """The daily realized loss (fractions) as a histogram, with the +-band (a fraction, e.g. 0.01) marked: how much of it sits around 0."""
+    fig = go.Figure(go.Histogram(x=loss, nbinsx=120, marker_color=MODEL_COLOR, hovertemplate="loss %{x:.2%}<br>%{y} days<extra></extra>"))
+    inside = float((loss.abs() <= band).mean())
+    for edge in (-band, band):
+        fig.add_vline(x=edge, line=dict(color=EWMA_COLOR, dash="dash", width=1.5))
+    fig.update_layout(
+        template=TEMPLATE, height=360, title=f"{title}: {inside:.0%} of the days inside ±{band:.1%}", bargap=0.02, showlegend=False,
+        xaxis=dict(title="realized loss", tickformat=".1%"), yaxis_title="days",
+    )
+    return fig
+
+
+def pairwise_matrix_figure(pairwise, order: list[str] | None = None) -> go.Figure:
     """
     The pairwise tick-loss matrix (core.pairwise_tick_loss_matrix): the cell of a row run against a column run is green
     when the row is significantly better, red when significantly worse, gray when they cannot be told apart. The number is
     the mean tick-loss difference (row minus column) in 1e-4 units, negative = the row costs less.
+    order: the runs in the order of the rows and columns (default: the order of the matrix).
     """
-    names = list(pairwise.mean_difference.index)
-    code = pairwise.verdict.replace({"better": 1.0, "worse": -1.0, "same": 0.0, "": float("nan")}).astype(float)
-    text = (pairwise.mean_difference * 1e4).round(2).astype(str)
+    names = list(order) if order else list(pairwise.mean_difference.index)
+    mean_difference, verdict, p_value = (frame.reindex(index=names, columns=names) for frame in (pairwise.mean_difference, pairwise.verdict, pairwise.p_value))
+    code = verdict.replace({"better": 1.0, "worse": -1.0, "same": 0.0, "": float("nan")}).astype(float)
+    text = (mean_difference * 1e4).round(2).astype(str)
     for name in names:
         text.loc[name, name] = ""
     fig = go.Figure(go.Heatmap(
         z=code.to_numpy(), x=names, y=names, text=text.to_numpy(), texttemplate="%{text}", xgap=2, ygap=2,
         colorscale=[[0, "#ef9a9a"], [0.5, "#eceff1"], [1, "#a5d6a7"]], zmin=-1, zmax=1, showscale=False,
-        customdata=pairwise.p_value.to_numpy(),
+        customdata=p_value.to_numpy(),
         hovertemplate="row: %{y}<br>column: %{x}<br>Holm-corrected p: %{customdata:.3f}<extra></extra>",
     ))
     fig.update_yaxes(autorange="reversed")

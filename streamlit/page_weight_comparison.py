@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -16,7 +17,11 @@ import streamlit as st
 import dashboard_data as dd
 import page_run_comparison as cmp
 import page_weight_adjustment as wa
+from core import portfolios as pf
 from core import walk_forward as wf
+
+TICKER_SET_KEY = "wc_ticker_set"        # the ticker set selectbox
+OPEN_SET_KEY = "wc_open_set"            # {"n_tickers", "train_bars", "forecast_bars"} of a ticker set another page (Results) wants opened here; a widget's own key would be dropped on the way
 
 
 @st.cache_data(show_spinner=False)
@@ -57,9 +62,48 @@ def _ticker_sets(store_run_ids: tuple, store_root: str) -> dict:
     return out
 
 
+def _find_set(sets: dict, store_root: str, n_tickers: int, train_bars: int, forecast_bars: int) -> str | None:
+    """The key of the ticker set with that many tickers and those windows (the biggest one when several), or None."""
+    for key, (ids, _) in sets.items():
+        run = cmp._run(ids[0], store_root)
+        if len(run.config["setting"]["tickers"]) == n_tickers and run.params["train_bars"] == train_bars and run.params["forecast_bars"] == forecast_bars:
+            return key
+    return None
+
+
+def _load_portfolio_panel(editor_id: str, tickers: list[str], store_root: str) -> None:
+    """
+    Load portfolio: a portfolio registered in the store (core.portfolios: the random Dirichlet portfolios, equal weights of a part of the tickers ...) that has exactly the
+    tickers of the set, put in the weights table below and applied. The saved portfolios are not listed on the Run comparison or the Single run page: they are here.
+    """
+    registered = pf.portfolios_table(Path(store_root))
+    if registered.empty:
+        return
+    weight_columns = [f"w_{t}" for t in tickers]
+    inside = registered.reindex(columns=weight_columns).fillna(0.0)
+    outside = registered[[c for c in registered.columns if c.startswith("w_") and c not in weight_columns]].fillna(0.0)
+    same = registered[(outside.abs().sum(axis=1) == 0) & (inside.sum(axis=1) > 0)]       # all the weight of the portfolio is on the tickers of the set
+    if same.empty:
+        st.caption("No portfolio saved in the store has all its weight on these tickers.")
+        return
+    registered_weights = inside.loc[same.index].set_axis(tickers, axis=1)      # the weights editor is indexed by the ticker, not by the column name w_<ticker>
+    with st.expander(f"Load portfolio ({len(same)} saved for these tickers)", expanded=False):
+        groups = same["tag_group"].fillna("(no group)") if "tag_group" in same else pd.Series("(no group)", index=same.index)
+        group = st.selectbox("Group", ["(all)", *sorted(groups.unique())], key=f"{editor_id}_group", help="The tag group of the portfolios (set when they were generated or saved).")
+        shown = same if group == "(all)" else same[groups == group]
+        picked = st.selectbox(
+            "Portfolio", list(shown.index), key=f"{editor_id}_portfolio_{group}",
+            format_func=lambda pid: f"{shown.loc[pid, 'name']}  (effective number {shown.loc[pid, 'n_eff']:.1f}, largest {shown.loc[pid, 'max_weight']:.0%})",
+        )
+        if st.button("Load portfolio", key=f"{editor_id}_load", type="primary", help="Fill the weights table with this portfolio's weights and apply them: the results below are for it."):
+            wa.load_weights(editor_id, registered_weights.loc[picked].astype(float))
+            st.rerun()
+
+
 def render(settings: dd.Settings, sidebar_top) -> None:
     st.title("Model comparison with user defined weights")
-    runs = cmp._runs(settings.tracking_uri, settings.experiment)
+    runs = cmp._runs(settings.tracking_uri, settings.experiment, settings.store_root)
+    runs = runs[~runs["store_run_id"].map(dd.is_virtual_run_id)] if not runs.empty else runs      # a portfolio run is already read for its weights: only runs of the walk-forwards are re-weighted
     if runs.empty:
         st.warning(f"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).")
         return
@@ -73,7 +117,14 @@ def render(settings: dd.Settings, sidebar_top) -> None:
     with sidebar_top:
         st.header("Ticker set", help="The tickers and the windows (train / forecast bars, start). The weights are yours: every run of the set is read with them, whatever weights it was trained or saved with.")
         sets = _ticker_sets(tuple(runs["store_run_id"]), store_root)
-        set_key = st.selectbox("Ticker set", list(sets), format_func=lambda k: f"{sets[k][1]} ({len(sets[k][0])} runs)", key="wc_ticker_set", label_visibility="collapsed")
+        wanted = st.session_state.pop(OPEN_SET_KEY, None)
+        if wanted is not None:      # arrived from another page: the ticker set it asked for, chosen before the selectbox is made
+            found = _find_set(sets, store_root, **wanted)
+            if found is None:
+                st.warning(f"No ticker set with {wanted['n_tickers']} tickers, train {wanted['train_bars']} / forecast {wanted['forecast_bars']} among the saved runs.")
+            else:
+                st.session_state[TICKER_SET_KEY] = found
+        set_key = st.selectbox("Ticker set", list(sets), format_func=lambda k: f"{sets[k][1]} ({len(sets[k][0])} runs)", key=TICKER_SET_KEY, label_visibility="collapsed")
         in_set = runs[runs["store_run_id"].isin(sets[set_key][0])]
         st.header("Runs")
         shown = in_set.drop(columns=[c for c in in_set.columns if c.startswith("total_window_")])    # the metrics of the run's own weights
@@ -82,7 +133,9 @@ def render(settings: dd.Settings, sidebar_top) -> None:
     first_run = cmp._run(in_set["store_run_id"].iloc[0], store_root)
     tickers = list(first_run.config["setting"]["tickers"])
     st.header("Weights", help="The values entered are normalised so that they sum to 1. Equal weights to start with.")
-    weights = wa._weights_editor(f"wc_{hashlib.sha256(set_key.encode()).hexdigest()[:8]}", pd.Series(1 / len(tickers), index=tickers))
+    editor_id = f"wc_{hashlib.sha256(set_key.encode()).hexdigest()[:8]}"
+    _load_portfolio_panel(editor_id, tickers, store_root)
+    weights = wa._weights_editor(editor_id, pd.Series(1 / len(tickers), index=tickers))
     key = tuple(sorted(weights.round(12).items()))
 
     selected = cmp._runs_table(shown, filtered, prefix="wc")

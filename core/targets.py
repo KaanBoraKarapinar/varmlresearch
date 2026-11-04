@@ -154,6 +154,27 @@ class RealizedVariance(Target):
 
 
 @dataclass(frozen=True)
+class LogRealizedVariance(Target):
+    """
+    y = log of the next bar's realized variance * scale; variance = exp(prediction / scale), so it is always positive (a target in levels can be forecast below zero, which the
+    variance floor turns into a standardized residual of 1e6 and a VaR of hundreds of percent). exp of a mean of logs is below the mean variance by a roughly constant factor:
+    the standardized-residual quantile absorbs it, as for LogVariance. Long format only.
+    """
+    needs_additional_data = True
+    supports_wide = False
+    tag = "rv"
+
+    def next_outcome(self, returns, additional):
+        return _additional_tickers_frame(returns, additional, self.tag).shift(-1)
+
+    def forward_make_y(self, next_rv, base_variance=None) -> np.ndarray:
+        return np.log(np.asarray(next_rv, dtype=float)) * self.scale
+
+    def inverse_to_variance(self, prediction, base_variance=None) -> np.ndarray:
+        return np.exp(np.clip(np.asarray(prediction, dtype=float) / self.scale, -50.0, 50.0))
+
+
+@dataclass(frozen=True)
 class RelativeRvChange(Target):
     """
     dRV_rel_next: y = RV_next / RV - 1 (the relative change of the realized variance from today to the next bar) * scale,

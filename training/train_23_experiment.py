@@ -11,7 +11,6 @@ can be applied to a calendar with another portfolio (ModelRecipe.pretrained_from
 
     S23  the 23 tickers, equal weight 1/23: the models are TRAINED here (pooled over 23 tickers); slim runs (no per-window feature files)
     S4   AAPL, JPM, XOM, KO, 0.25 each: the S23 models APPLIED (names ..._from23) and, as the reference, the same models TRAINED on the 4 tickers
-    S13  the 13 tickers of the first batch, 1/13 each: the S23 models applied (slim)
 
 The runs are saved in the run store (a saved run is reused: the script can be run again after an interruption) and logged to MLflow.
 """
@@ -42,8 +41,10 @@ MLFLOW_EXPERIMENT = 'walk_forward_horizon'
 READING = wf.Reading(var_confidence=0.95, window_size=252, min_periods=30, test_confidence=0.95)
 
 TICKERS_4 = ['AAPL', 'JPM', 'XOM', 'KO']
-TICKERS_13 = ["AAPL", "MSFT", "NVDA", "AVGO", "GOOGL", "META", "NFLX", "AMZN", "HD", "MCD", "PG", "KO", "WMT"]
-TICKERS_23 = TICKERS_13 + ["XOM", "CVX", "JPM", "GS", "BAC", "V", "JNJ", "UNH", "LLY", "MRK"]
+TICKERS_23 = [      # the order is part of the walk-forward id: do not reorder
+    "AAPL", "MSFT", "NVDA", "AVGO", "GOOGL", "META", "NFLX", "AMZN", "HD", "MCD", "PG", "KO", "WMT",
+    "XOM", "CVX", "JPM", "GS", "BAC", "V", "JNJ", "UNH", "LLY", "MRK",
+]
 
 prices = pd.read_csv(DATA_PATH, parse_dates=['Date'], index_col='Date')       # META is empty before 2012-05-18: the walk-forwards start in 2016
 
@@ -88,8 +89,8 @@ def timed(label: str, function):
 
 
 def main() -> None:
-    s23, s4, s13 = setting_of(TICKERS_23), setting_of(TICKERS_4), setting_of(TICKERS_13)
-    for name, s in (("S23", s23), ("S4", s4), ("S13", s13)):
+    s23, s4 = setting_of(TICKERS_23), setting_of(TICKERS_4)
+    for name, s in (("S23", s23), ("S4", s4)):
         table = s.window_table()
         print(f"{name}: {len(s.tickers)} tickers, {len(table)} windows, forecast {table['forecast_start'].iloc[0].date()} .. {table['forecast_end'].iloc[-1].date()} | {s.walk_forward_id[-40:]}", flush=True)
 
@@ -109,14 +110,7 @@ def main() -> None:
         applied = dataclasses.replace(recipe, pretrained_from=trained[name].run_id)
         timed(f"S4  {name}_from23 (the 23-ticker model applied)", lambda: rs.train_and_save_walk_forward_run(s4, applied, f"{name}_from23"))
 
-    # 3. the 13 tickers: the baselines and the 23-ticker models applied
-    for name, recipe in BASELINES.items():
-        timed(f"S13 {name}", lambda: rs.train_and_save_walk_forward_run(s13, recipe, name, slim=True))
-    for name, recipe in XGB_RECIPES.items():
-        applied = dataclasses.replace(recipe, pretrained_from=trained[name].run_id)
-        timed(f"S13 {name}_from23 (the 23-ticker model applied)", lambda: rs.train_and_save_walk_forward_run(s13, applied, f"{name}_from23", slim=True))
-
-    walk_forward_ids = {s23.walk_forward_id, s4.walk_forward_id, s13.walk_forward_id}
+    walk_forward_ids = {s23.walk_forward_id, s4.walk_forward_id}
     for run in [r for r in rs.load_runs(train_bars=756, forecast_bars=21) if r.walk_forward_id in walk_forward_ids]:
         rs.log_walk_forward_run_to_mlflow(run, READING, experiment=MLFLOW_EXPERIMENT)
     print("done", flush=True)

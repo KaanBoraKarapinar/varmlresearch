@@ -43,6 +43,14 @@ def _original_var_df(store_run_id: str, store_root: str, reading: wf.Reading) ->
     return cmp._run(store_run_id, store_root).var_df(reading)
 
 
+def load_weights(run_id: str, weights: pd.Series) -> None:
+    """Put these weights in the table of _weights_editor(run_id, ...) and apply them (what the page shows from its next run on): the editor's own state, set from outside."""
+    version = st.session_state.get(f"wa_version_{run_id}", 0) + 1
+    st.session_state[f"wa_start_{run_id}_{version}"] = weights
+    st.session_state[f"wa_version_{run_id}"] = version
+    st.session_state[f"wa_applied_{run_id}"] = weights / weights.sum()
+
+
 def _weights_editor(run_id: str, default: pd.Series) -> pd.Series:
     """
     The weights table (one row per ticker, editable) and its buttons. Editing the table changes nothing that is computed: the weights in use are
@@ -90,7 +98,8 @@ def _weights_editor(run_id: str, default: pd.Series) -> pd.Series:
 
 def render(settings: dd.Settings, sidebar_top) -> None:
     st.title("Portfolio ticker weight adjustment")
-    runs = cmp._runs(settings.tracking_uri, settings.experiment)
+    runs = cmp._runs(settings.tracking_uri, settings.experiment, settings.store_root)
+    runs = runs[~runs["store_run_id"].map(dd.is_virtual_run_id)] if not runs.empty else runs      # a portfolio run is already read for its weights: only runs of the walk-forwards are re-weighted
     if runs.empty:
         st.warning(f"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).")
         return

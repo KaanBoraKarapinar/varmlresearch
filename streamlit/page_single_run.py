@@ -15,9 +15,14 @@ from tools.graph_helpers import plot_exceedance_days_focus, plot_var_models_vs_l
 READING_COLORS = [None, "red", "blue", "green", "violet", "orange"]   # None = the sidebar reading (default text color)
 
 
-@st.cache_data(show_spinner="Listing the runs from MLflow ...")
-def _runs(tracking_uri: str, experiment: str) -> pd.DataFrame:
-    return dd.list_mlflow_runs(tracking_uri, experiment)
+@st.cache_data(show_spinner="Listing the runs ...")
+def _runs_cached(tracking_uri: str, experiment: str, store_root: str, stamp: tuple) -> pd.DataFrame:
+    return dd.list_runs(tracking_uri, experiment, store_root)
+
+
+def _runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:
+    """The runs of MLflow and the portfolio runs kept in the store; the stamp makes the cache notice a portfolio run that was saved since."""
+    return _runs_cached(tracking_uri, experiment, store_root, dd.virtual_runs_stamp(store_root))
 
 
 @st.cache_resource(show_spinner=False)
@@ -43,7 +48,8 @@ def _ticker_frames(store_run_id: str, store_root: str) -> dict:
 def render(settings: dd.Settings, sidebar_top) -> None:
     """sidebar_top: the container at the top of the left column (dashboard.py), where this page puts its run controls."""
     st.title("Single run")
-    runs = _runs(settings.tracking_uri, settings.experiment)
+    runs = _runs(settings.tracking_uri, settings.experiment, settings.store_root)
+    runs = runs[~runs["store_run_id"].map(dd.is_virtual_run_id)] if not runs.empty else runs     # the saved portfolios are not runs of a walk-forward: they are on the user defined weights page
     if runs.empty:
         st.warning(f"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).")
         return

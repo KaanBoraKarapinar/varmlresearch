@@ -8,19 +8,28 @@ import streamlit as st
 import core
 import dashboard_data as dd
 import dashboard_figures as figs
+from core import realized_loss as rl
 from core import run_store as rs
 from core import walk_forward as wf
 from core.units import format_value
 from tools.graph_helpers import plot_cumulative_tick_loss_difference, plot_exceedance_days_focus, plot_var_models_vs_loss
 
 FILTER_COLUMNS = ["portfolio", "train_bars", "model_family", "model_format", "target"]
+MIN_ANALYSIS_DAYS = 30      # the pages that compare runs refuse an analysis period shorter than this
+TABS = ["Selected runs", "VaR review", "Predicted vs realized variance", "Per ticker variance", "Exceedances / Daily VaR explaining"]
+VAR_REVIEW_TAB = TABS[1]
 
 
 # ---- cached loading ----------------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Listing the runs from MLflow ...")
-def _runs(tracking_uri: str, experiment: str) -> pd.DataFrame:
-    return dd.list_mlflow_runs(tracking_uri, experiment)
+@st.cache_data(show_spinner="Listing the runs ...")
+def _runs_cached(tracking_uri: str, experiment: str, store_root: str, stamp: tuple) -> pd.DataFrame:
+    return dd.list_runs(tracking_uri, experiment, store_root)
+
+
+def _runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:
+    """The runs of MLflow and the portfolio runs kept in the store; the stamp makes the cache notice a portfolio run that was saved since."""
+    return _runs_cached(tracking_uri, experiment, store_root, dd.virtual_runs_stamp(store_root))
 
 
 @st.cache_resource(show_spinner=False)
@@ -32,6 +41,12 @@ def _ewma_references(runs: pd.DataFrame, store_root: str) -> dict[str, wf.Run]:
     """The saved 'ewma' runs of the table by label: the plain EWMA variance the models are compared with on the variance tab."""
     ewma_runs = runs[runs["model_family"] == "ewma"].set_index("display_name")
     return {label: _run(row["store_run_id"], store_root) for label, row in ewma_runs.iterrows()}
+
+
+def _portfolio_key(run: wf.Run) -> tuple:
+    """The tickers with their weights: runs with the same key are scored against the same realized losses, so they can be compared on their common days."""
+    setting = run.config["setting"]
+    return tuple(sorted((t, round(float(setting["weights"][t]), 9)) for t in setting["tickers"]))
 
 
 def _runs_by_label(table: pd.DataFrame, labels: list[str], store_root: str) -> dict[str, wf.Run]:
@@ -60,7 +75,8 @@ def _slice(frame: pd.DataFrame, start, end) -> pd.DataFrame:
 def render(settings: dd.Settings, sidebar_top) -> None:
     """sidebar_top: the container at the top of the left column (dashboard.py), where this page puts its run selection and period."""
     st.title("Run comparison")
-    runs = _runs(settings.tracking_uri, settings.experiment)
+    runs = _runs(settings.tracking_uri, settings.experiment, settings.store_root)
+    runs = runs[~runs["store_run_id"].map(dd.is_virtual_run_id)] if not runs.empty else runs     # the saved portfolios are not runs of a walk-forward: they are on the user defined weights page
     if runs.empty:
         st.warning(f"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).")
         return
@@ -80,9 +96,7 @@ def render(settings: dd.Settings, sidebar_top) -> None:
     chosen = _runs_by_label(filtered, selected, store_root)
     portfolios: dict[tuple, list[str]] = {}
     for label, run in chosen.items():
-        setting = run.config["setting"]
-        key = tuple(sorted((t, round(float(setting["weights"][t]), 9)) for t in setting["tickers"]))
-        portfolios.setdefault(key, []).append(label)
+        portfolios.setdefault(_portfolio_key(run), []).append(label)
     if len(portfolios) > 1:        # the runs would be scored against different realized losses
         st.warning(
             f"The selected runs are of {len(portfolios)} different portfolios (tickers or weights): they cannot be compared on one set of days. "
@@ -92,7 +106,7 @@ def render(settings: dd.Settings, sidebar_top) -> None:
         return
     common = _common(ids, labels, store_root, reading)
     dates = common["dates"]
-    if len(dates) < 30:
+    if len(dates) < MIN_ANALYSIS_DAYS:
         st.warning(f"The selected runs share only {len(dates)} days: too few for a comparison.")
         return
 
@@ -109,25 +123,41 @@ def render(settings: dd.Settings, sidebar_top) -> None:
     start, end = pd.Timestamp(picked[0]), pd.Timestamp(picked[1])
     var_dfs = {label: _slice(frame, start, end) for label, frame in common["var_dfs"].items()}
     dailies = {label: _slice(frame, start, end) for label, frame in common["dailies"].items()}
-    if len(next(iter(var_dfs.values()))) < 30:
-        st.warning("The analysis period has fewer than 30 days: pick a longer one.")
+    if len(next(iter(var_dfs.values()))) < MIN_ANALYSIS_DAYS:
+        st.warning(f"The analysis period has fewer than {MIN_ANALYSIS_DAYS} days: pick a longer one.")
         st.stop()
     st.success(f"{len(selected)} runs on {len(next(iter(var_dfs.values())))} common days: {start.date()} → {end.date()}")
 
     analysis(table, chosen, var_dfs, dailies, baseline, settings, start, end, _ewma_references(runs, store_root))
 
 
+def _model_ids(labels: list[str]) -> dict[str, str]:
+    """M01, M02, ... for the labels in the given order (as many digits as the largest id needs, so that the ids sort as text too)."""
+    width = len(str(len(labels)))
+    return {label: f"M{i:0{width}d}" for i, label in enumerate(labels, start=1)}
+
+
 def analysis(
     table: pd.DataFrame, chosen: dict[str, wf.Run], var_dfs: dict, dailies: dict,
-    baseline: str, settings: dd.Settings, start, end, ewma_references: dict[str, wf.Run],
+    baseline: str, settings: dd.Settings, start, end, ewma_references: dict[str, wf.Run], id_order: list[str] | None = None, default_tab: str | None = None,
 ) -> None:
     """
     The tabs for a set of runs on one analysis period (shared with the Experiments page and the user-defined-weights page). chosen: the runs
     by label (any wf.Run), table: one row per run, index = label. ewma_references: the EWMA runs the variance tab can compare with, by label.
+
+    Every run gets an id (M01, M02, ... in the order of `table`) that leads its label in every table and chart, and every table lists the runs in that order.
+    id_order: the labels the ids are counted over when the runs shown are a part of a longer list (so that a run keeps its id when another is unticked).
+    default_tab: the tab that is open to start with (one of TABS); None: the first.
     """
-    tabs = st.tabs(["Selected runs", "VaR review", "Predicted vs realized variance", "Per ticker variance", "Exceedances / Daily VaR explaining"])
+    ids = _model_ids(id_order or list(table.index))
+    named = {label: f"{ids[label]} · {label}" for label in table.index}
+    table, chosen = table.rename(index=named), {named[label]: run for label, run in chosen.items()}
+    var_dfs, dailies, baseline = {named[label]: frame for label, frame in var_dfs.items()}, {named[label]: frame for label, frame in dailies.items()}, named[baseline]
+
+    tabs = st.tabs(TABS, default=default_tab)
     with tabs[0]:
         _selected_tab(table, chosen)
+        _realized_loss_section(dailies, start, end)
     with tabs[1]:
         _review_tab(chosen, table, var_dfs, dailies, baseline, settings)
     with tabs[2]:
@@ -160,29 +190,34 @@ def _filters(runs: pd.DataFrame, prefix: str = "cmp") -> pd.DataFrame:
     return filtered
 
 
-def _runs_table(runs: pd.DataFrame, filtered: pd.DataFrame, prefix: str = "cmp") -> list[str]:
+def _runs_table(runs: pd.DataFrame, filtered: pd.DataFrame, prefix: str = "cmp", initial: set[str] | None = None) -> list[str]:
     """
     The runs as a table with a checkbox per row; the ticked rows are the runs to compare. The table (and so the ticks) start
     afresh when the filters change it. The buttons tick all / none by giving the table a new state.
     prefix: the start of the widget / state keys, so two pages that use this do not share their ticks.
+    initial: the display names ticked to start with, until a button is pressed (the runs of an experiment); a third button brings them back.
     """
     metric_columns = [m for m in dd.HEADLINE_METRICS if m in filtered.columns]
     st.markdown(
         f"**Runs: {len(filtered)} of {len(runs)}**",
         help="Tick the box of a run to compare it. The metrics here are each run's own full period as logged to MLflow; the tabs below re-run everything on the days the selected runs share.",
     )
-    start_ticked = st.session_state.get(f"{prefix}_default_ticked", False)
+    start_ticked = st.session_state.get(f"{prefix}_default_ticked", None)       # None: no button pressed yet
     nonce = st.session_state.get(f"{prefix}_editor_nonce", 0)
-    left, right, _ = st.columns([1, 1, 5])
+    left, middle, right, _ = st.columns([1, 1, 1.6, 4])
     if left.button("Tick all", key=f"{prefix}_tick_all"):
         st.session_state.update({f"{prefix}_default_ticked": True, f"{prefix}_editor_nonce": nonce + 1})
         st.rerun()
-    if right.button("Tick none", key=f"{prefix}_tick_none"):
+    if middle.button("Tick none", key=f"{prefix}_tick_none"):
         st.session_state.update({f"{prefix}_default_ticked": False, f"{prefix}_editor_nonce": nonce + 1})
+        st.rerun()
+    if initial is not None and right.button("Experiment's runs", key=f"{prefix}_tick_initial", help="Tick the runs the experiment was saved with, and only those."):
+        st.session_state.pop(f"{prefix}_default_ticked", None)
+        st.session_state[f"{prefix}_editor_nonce"] = nonce + 1
         st.rerun()
 
     shown = filtered[["display_name", *dd.parameter_columns(filtered), *metric_columns]].reset_index(drop=True)
-    shown.insert(0, "compare", start_ticked)
+    shown.insert(0, "compare", shown["display_name"].isin(initial) if start_ticked is None and initial is not None else bool(start_ticked))
     signature = hash(tuple(shown["display_name"]))
     edited = st.data_editor(
         shown, hide_index=True, width="stretch", key=f"{prefix}_editor_{nonce}_{signature}",
@@ -202,6 +237,39 @@ def _selected_tab(table: pd.DataFrame, chosen: dict) -> None:
     spans = {label: dd.run_span(run) for label, run in chosen.items()}
     st.plotly_chart(figs.timeline_figure(spans), width="stretch")
     st.dataframe(pd.DataFrame(spans).T, width="stretch")
+
+
+LOSS_STATISTIC_HELP = (
+    "The realized loss is what the VaR is scored against: minus the portfolio's daily return. Diversified stocks hedge each other, so it is centered heavily around 0: "
+    "the std and the shares of days inside ±0.5% / 1% / 2% say how tightly. A large excess kurtosis means that, on top of that, a few days are far out (the tails the VaR is about)."
+)
+
+
+def style_loss_statistics(stats: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """The statistics of core.realized_loss.realized_loss_statistics for display (the values stay numbers, so a column sorts as numbers): losses as percent, shares as percent."""
+    formats = {}
+    for column in stats.columns:
+        if not pd.api.types.is_numeric_dtype(stats[column]):
+            continue                                                   # a name or a tag next to the statistics
+        if column in ("days", "portfolios"):
+            formats[column] = "{:.0f}"
+        elif column in ("skew", "excess kurtosis", "n_eff"):
+            formats[column] = "{:.2f}" if column != "n_eff" else "{:.1f}"
+        elif column.startswith("|loss|") or column == "max_weight":
+            formats[column] = "{:.1%}"
+        elif column in ("mean", "median"):
+            formats[column] = lambda value: format_value(value, 3)
+        else:
+            formats[column] = lambda value: format_value(value, 2)
+    return stats.style.format(formats)
+
+
+def _realized_loss_section(dailies: dict, start, end) -> None:
+    """The distribution of the portfolio's realized loss on the analysis period (the same in every run, so the first one is read)."""
+    loss = next(iter(dailies.values()))["loss"]
+    st.markdown("**Realized loss of the portfolio on this period**", help=LOSS_STATISTIC_HELP)
+    st.dataframe(style_loss_statistics(rl.realized_loss_statistics(loss.rename("analysis period"))), width="stretch")
+    st.plotly_chart(figs.loss_histogram_figure(loss, rl.CONCENTRATION_BANDS[1], f"Realized loss {start.date()} → {end.date()}"), width="stretch")
 
 
 # ---- tab: VaR review ---------------------------------------------------------------------------------
@@ -278,6 +346,67 @@ def _review_tables(backtest: pd.DataFrame, level: pd.DataFrame, baseline: str) -
     return test, conservativity
 
 
+def _all_review_tables(
+    backtest: pd.DataFrame, level: pd.DataFrame, against: pd.DataFrame, selection: core.RunSelection | None, baseline: str, labels: list[str],
+) -> pd.io.formats.style.Styler:
+    """
+    Every table of the VaR review tab in one: one row per run (`labels`), the columns in groups. The values stay numbers (only their display is formatted),
+    so that a click on a header sorts them as numbers. selection: the ranking (None when there is a single run).
+    """
+    number = lambda frame, key: frame.loc[key].astype(float).reindex(labels)
+    passed = lambda key: backtest.loc[key].map(lambda v: "PASS" if bool(v) else "FAIL").reindex(labels)
+    versus = lambda key: (number(level, key) / number(level, key)[baseline] - 1).where(pd.Index(labels) != baseline)      # the baseline itself is left empty
+    loss, exceedance_part = number(level, "mean_tick_loss"), number(level, "tick_loss_exceedance_part")
+    unit = lambda value: format_value(value, 3)
+    columns = {                       # (group, measure): (values by run, display format)
+        ("Test metrics", "forecast days"): (number(backtest, "n_days"), "{:.0f}"),
+        ("Test metrics", "exceedances"): (number(backtest, "n_exceedances"), "{:.0f}"),
+        ("Test metrics", "exceedance rate"): (number(backtest, "exceedance_rate"), "{:.2%}"),
+        ("Test metrics", "Kupiec POF"): (passed("kupiec_pof_pass"), "{}"),
+        ("Test metrics", "Christoffersen independence"): (passed("christoffersen_ind_pass"), "{}"),
+        ("Test metrics", "Christoffersen conditional coverage"): (passed("christoffersen_cc_pass"), "{}"),
+        ("Conservativity", "mean tick loss"): (loss, "{:.6f}"),
+        ("Conservativity", "tick loss from exceedance"): (exceedance_part, "{:.6f}"),
+        ("Conservativity", "tick loss from overshoot"): (number(level, "tick_loss_overshoot_part"), "{:.6f}"),
+        ("Conservativity", "% of tick loss from exceedance"): (exceedance_part / loss, "{:.1%}"),
+        ("Conservativity", "% of tick loss from overshoot"): (number(level, "tick_loss_overshoot_part") / loss, "{:.1%}"),
+        ("Conservativity", "mean slack"): (number(level, "mean_slack_non_exceedance"), unit),
+        ("Conservativity", "VaR / realized quantile"): (number(level, "var_to_realized_quantile_ratio"), "{:.3f}"),
+        ("Conservativity", "mean VaR"): (number(level, "mean_var"), unit),
+        ("Against the baseline run", "VaR level"): (versus("mean_var"), "{:+.1%}"),
+        ("Against the baseline run", "unused capital (slack)"): (versus("mean_slack_non_exceedance"), "{:+.1%}"),
+        ("Against the baseline run", "tick loss"): (versus("mean_tick_loss"), "{:+.1%}"),
+        ("Against the baseline run", "tick loss from exceedance"): (versus("tick_loss_exceedance_part"), "{:+.1%}"),
+        ("Against the baseline run", "tick loss from overshoot"): (versus("tick_loss_overshoot_part"), "{:+.1%}"),
+        ("Against the baseline", "tick loss diff"): (against["tick_loss_diff"].astype(float).reindex(labels), "{:+.6f}"),
+        ("Against the baseline", "tick loss relative diff"): (against["tick_loss_relative_diff"].astype(float).reindex(labels), "{:+.1%}"),
+        ("Against the baseline", "days better share"): (against["days_better_share"].astype(float).reindex(labels), "{:.1%}"),
+        ("Against the baseline", "exceedance diff"): (against["exceedance_diff"].astype(float).reindex(labels), "{:+.0f}"),
+        ("Against the baseline", "DM t"): (against["dm_t_stat"].astype(float).reindex(labels), "{:.2f}"),
+        ("Against the baseline", "DM p"): (against["dm_p_value"].astype(float).reindex(labels), "{:.3f}"),
+    }
+    if selection is not None:
+        board = selection.leaderboard.reindex(labels)
+        columns.update({
+            ("Ranking", "tests"): (board["valid"].map(lambda v: "PASS" if v else "FAIL"), "{}"),
+            ("Ranking", "in the set"): (board["in_mcs"].map(lambda v: "yes" if v else "no"), "{}"),
+            ("Ranking", "set p-value"): (board["mcs_p_value"].astype(float), "{:.3f}"),
+            ("Ranking", "blocks won"): (board["blocks_won"].astype(float), "{:.0f}"),
+            ("Ranking", "mean block rank"): (board["mean_block_rank"].astype(float), "{:.2f}"),
+            ("Ranking", "verdict"): (board["verdict"], "{}"),
+        })
+    frame = pd.DataFrame({key: values for key, (values, _) in columns.items()}, index=labels)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+    styled = frame.style
+    for key, (_, display) in columns.items():
+        styled = styled.format(display, subset=pd.IndexSlice[:, [key]], na_rep="–")
+    pass_fail = [key for key in columns if key[1] in ("Kupiec POF", "Christoffersen independence", "Christoffersen conditional coverage", "tests")]
+    styled = styled.map(_verdict_style, subset=pd.IndexSlice[:, pass_fail])
+    if selection is not None:
+        styled = styled.map(_verdict_color, subset=pd.IndexSlice[:, [("Ranking", "verdict")]])
+    return styled
+
+
 def _review_tab(chosen: dict, table: pd.DataFrame, var_dfs: dict, dailies: dict, baseline: str, settings: dd.Settings) -> None:
     reading = settings.reading
     dates = next(iter(var_dfs.values())).index
@@ -334,9 +463,13 @@ def _review_tab(chosen: dict, table: pd.DataFrame, var_dfs: dict, dailies: dict,
         st.plotly_chart(figs.cumulative_tick_loss_figure({label: core.daily_tick_loss(var_dfs[label], reading.var_confidence).cumsum() for label in chosen}), width="stretch")
 
     st.markdown("**Against the baseline**", help="Run minus baseline, so negative is better. dm_p_value is the Diebold-Mariano test of the daily tick-loss difference (HAC).")
-    st.dataframe(core.compare_to_baseline(var_dfs, baseline, reading.var_confidence), width="stretch")
-    if len(var_dfs) > 1:
-        _best_run_section(var_dfs, baseline, reading)
+    against = core.compare_to_baseline(var_dfs, baseline, reading.var_confidence)
+    st.dataframe(against, width="stretch")
+    selection = _best_run_section(var_dfs, baseline, reading) if len(var_dfs) > 1 else None
+
+    with st.expander("All the tables of this tab side by side", expanded=False):
+        st.caption("One row per model, every measure of the tables above in one table. Click a column header to sort the models by it.")
+        st.dataframe(_all_review_tables(backtest, level, against, selection, baseline, list(var_dfs)), width="stretch", height=fit(var_dfs))
 
 
 # ---- which run is best (the logic is core.select_best_run) ------------------------------------------------
@@ -353,12 +486,12 @@ def _verdict_color(value: str) -> str:
     }.get(value, "")
 
 
-def _best_run_section(var_dfs: dict, baseline: str, reading: wf.Reading) -> None:
+def _best_run_section(var_dfs: dict, baseline: str, reading: wf.Reading) -> core.RunSelection:
     st.markdown(
         "**Run ranking**",
         help="The tick loss alone cannot decide: a gap of a few percent is inside the noise of the period. A run is valid when it passes the Kupiec and both Christoffersen tests. "
              "The Model Confidence Set keeps the runs that cannot be told apart from the best one at the chosen level (it corrects for comparing many runs and for dependent days). "
-             "The best set is the valid runs inside the set, the best run is the one of them with the lowest mean tick loss. Blocks are consecutive stretches of 252 common days: "
+             "The best set is the valid runs inside the set, the best run is the one of them with the lowest mean tick loss. Blocks are the calendar years of the analysis period (the first and the last may be partial): "
              "how many blocks a run wins and its mean rank (1 = best) show whether it is consistently good.",
     )
     alpha = st.select_slider("Level of the Model Confidence Set", [0.05, 0.10, 0.25], value=0.10, key="cmp_mcs_alpha",
@@ -369,7 +502,7 @@ def _best_run_section(var_dfs: dict, baseline: str, reading: wf.Reading) -> None
     else:
         st.success(f"Top run: {selection.best}")
 
-    board = selection.leaderboard
+    board = selection.leaderboard.reindex(list(var_dfs))        # the order of the ids like every other table, not the order of the ranking (the verdict column has that)
     shown = pd.DataFrame({
         "mean tick loss": board["mean_tick_loss"].map(lambda v: f"{v:.6f}"),
         "tests": board["valid"].map(lambda v: "PASS" if v else "FAIL"),
@@ -385,7 +518,8 @@ def _best_run_section(var_dfs: dict, baseline: str, reading: wf.Reading) -> None
         shown.style.map(_verdict_color, subset=["verdict"]).map(_verdict_style, subset=["tests"]),
         width="stretch", height=(len(shown) + 1) * 35 + 3,
     )
-    st.plotly_chart(figs.pairwise_matrix_figure(selection.pairwise), width="stretch")
+    st.plotly_chart(figs.pairwise_matrix_figure(selection.pairwise, order=list(var_dfs)), width="stretch")
+    return selection
 
 
 # ---- tab: predicted vs realized variance ---------------------------------------------------------------

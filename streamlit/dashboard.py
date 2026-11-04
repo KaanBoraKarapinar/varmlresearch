@@ -1,8 +1,9 @@
 """
 Walk-forward run dashboard.   streamlit run streamlit/dashboard.py
 
-Page 1 compares runs (listed from MLflow, read from the run store), page 2 shows one run in detail.
-The sidebar decides where the runs come from and how the VaR is read (run_store.Reading).
+The pages, in order: Approach (the README), Results (the written results, linked to the experiments), Run comparison (runs listed from MLflow, read from the run
+store), Single run, Experiments, Portfolio ticker weight adjustment, Model comparison with user defined weights.
+The sidebar decides how the VaR is read (run_store.Reading).
 """
 
 import os
@@ -10,7 +11,9 @@ import os
 import streamlit as st
 
 import dashboard_data as dd
+import page_approach
 import page_experiments
+import page_results
 import page_run_comparison
 import page_single_run
 import page_weight_adjustment
@@ -41,11 +44,15 @@ settings = dd.Settings(
     TRACKING_URI, MLFLOW_EXPERIMENT, STORE_ROOT,
     wf.Reading(var_confidence, None if window_size is None else int(window_size), int(min_periods), test_confidence),
 )
+experiments_page = st.Page(lambda: page_experiments.render(settings, page_slot), title="Experiments", url_path="experiments")
+weight_comparison_page = st.Page(lambda: page_weight_comparison.render(settings, page_slot), title="Model comparison with user defined weights", url_path="weight-comparison")
 navigation = st.navigation([
-    st.Page(lambda: page_run_comparison.render(settings, page_slot), title="Run comparison", url_path="compare", default=True),
+    st.Page(lambda: page_approach.render(), title="Approach", url_path="approach", default=True),
+    st.Page(lambda: page_results.render(settings, page_slot, experiments_page, weight_comparison_page), title="Results", url_path="results"),
+    st.Page(lambda: page_run_comparison.render(settings, page_slot), title="Run comparison", url_path="compare"),
     st.Page(lambda: page_single_run.render(settings, page_slot), title="Single run", url_path="run"),
-    st.Page(lambda: page_experiments.render(settings, page_slot), title="Experiments", url_path="experiments"),
+    experiments_page,
     st.Page(lambda: page_weight_adjustment.render(settings, page_slot), title="Portfolio ticker weight adjustment", url_path="weights"),
-    st.Page(lambda: page_weight_comparison.render(settings, page_slot), title="Model comparison with user defined weights", url_path="weight-comparison"),
+    weight_comparison_page,
 ])
 navigation.run()

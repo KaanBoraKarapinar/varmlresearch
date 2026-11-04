@@ -32,8 +32,13 @@ UNIVERSES = {
     "13tickers": ["AAPL", "MSFT", "NVDA", "AVGO", "GOOGL", "META", "NFLX", "AMZN", "HD", "MCD", "PG", "KO", "WMT"],   # files: RV_sip_13tickers.csv, ...
 }
 UNIVERSES["23tickers"] = UNIVERSES["13tickers"] + ["XOM", "CVX", "JPM", "GS", "BAC", "V", "JNJ", "UNH", "LLY", "MRK"]   # the 13 + 10 more
-BASE_UNIVERSES = {"23tickers": "13tickers"}      # tickers already downloaded for the base universe are read from its bar file, not fetched again
-UNIVERSE = "23tickers"
+UNIVERSES["49tickers"] = UNIVERSES["23tickers"] + [      # the 23 + 26 more, to fill the thin sectors (technology, communication, consumer, energy, financials, health care, industrials, utilities, materials, real estate)
+    "ORCL", "CRM", "AMD", "CSCO", "DIS", "TMUS", "TSLA", "LOW", "PEP", "COST", "COP", "BRK.B", "MS", "MA", "ABBV", "TMO", "ABT",
+    "CAT", "GE", "RTX", "HON", "UNP", "NEE", "DUK", "SHW", "PLD",      # LIN (Linde) is not in the list: its 5-minute data starts on 2018-10-31, the other 49 tickers have it from 2016-01-04
+]
+# tickers already downloaded for the base universe are read from its bar file, not fetched again. The 50-ticker file (the 49 + LIN) is the one that was fetched from Alpaca: the 49 are cut out of it
+BASE_UNIVERSES = {"23tickers": "13tickers", "49tickers": "50tickers"}
+UNIVERSE = "49tickers"
 TICKERS = UNIVERSES[UNIVERSE]
 SUFFIX = "" if UNIVERSE == "4tickers" else f"_{UNIVERSE}"
 START = "2016-01-01"         # YYYY-MM-DD. IEX has nothing before 2020-07-27; SIP reaches back to 2016 (checked on this account)
@@ -112,7 +117,11 @@ def main() -> None:
             reused = [t for t in TICKERS if t in set(base["ticker"])]
             parts.append(base[base["ticker"].isin(reused)].rename(columns={"ticker": "symbol", "date": "timestamp"}).set_index(["symbol", "timestamp"]))
             print(f"reused from {base_path.name}: {len(reused)} tickers, not fetched again", flush=True)
-    parts.append(fetch_bars([t for t in TICKERS if t not in reused], START, END))
+    to_fetch = [t for t in TICKERS if t not in reused]
+    if to_fetch:
+        parts.append(fetch_bars(to_fetch, START, END))
+    elif not parts:
+        raise SystemExit(f"Nothing to read for {UNIVERSE}: no tickers reused and none to fetch.")
     bars = pd.concat(parts)
     syms = bars.index.get_level_values("symbol").unique()
     missing = [t for t in TICKERS if t not in syms]

@@ -16,8 +16,16 @@ __pycache__/
 # old files kept on disk, not in the repository
 archive/
 
+# the few tests there are (the parallel trainer against the sequential one), kept on disk, not in the repository
+tests/
+
 # notes and diagrams that are not ready yet
 docs/
 
+# personal learning notes
+learn/
+
 # working notebooks (the reference notebook is core/reference.ipynb and stays in the repository)
 notebooks/
+approach.pdf
+results.pdf

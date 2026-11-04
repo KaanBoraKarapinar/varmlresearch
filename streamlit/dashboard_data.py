@@ -25,6 +25,7 @@ import pandas as pd
 
 import core
 from core import run_store as rs
+from core import virtual_runs as vr
 from core import walk_forward as wf
 
 @dataclass(frozen=True)
@@ -119,6 +120,50 @@ def _unique_labels(runs: pd.DataFrame) -> pd.Series:
     return labels
 
 
+def list_virtual_runs(store_root: str) -> pd.DataFrame:
+    """
+    One row per portfolio run kept under <walk_forward>/VirtualRuns/ (run_store.save_virtual_run / save_baseline_runs), with the columns of
+    list_mlflow_runs, built from the definitions in the ledgers (no run is loaded): label '<model> | <portfolio> | train N f M', 'portfolio' = the
+    portfolio's name, 'kind' = reweighted | trained, and one tag_<key> column per tag of the portfolios (a filter for the group, the generator, ...).
+    They are not in MLflow (no metrics).
+    """
+    root, rows = Path(store_root), []
+    for walk_forward_id in vr.walk_forward_ids_with_virtual_runs(root):
+        for definition in vr.list_definitions(root, walk_forward_id):
+            config, portfolio = definition["config"], definition["config"]["portfolio"]
+            rows.append({
+                "display_name": config["display_name"], "name": config["name"], "store_run_id": config["run_id"],
+                "walk_forward_id": walk_forward_id, "store_path": str(vr.virtual_runs_dir(root, walk_forward_id)), "mlflow_run_id": None,
+                **config["params"], "portfolio": portfolio["name"], "kind": definition["kind"].replace("trained_baseline", "trained"),
+                **{f"tag_{key}": value for key, value in portfolio.get("tags", {}).items()},
+            })
+    return pd.DataFrame(rows)
+
+
+def virtual_runs_stamp(store_root: str) -> tuple:
+    """The ledgers and the portfolio registry with their modification times: a cache key that changes when a portfolio run is saved."""
+    root = Path(store_root)
+    files = [root / "WalkForwardSetting" / w / "VirtualRuns" / "_ledger.jsonl" for w in vr.walk_forward_ids_with_virtual_runs(root)]
+    files += [root / "Portfolios" / "portfolios.jsonl"]
+    return tuple((str(p), p.stat().st_mtime_ns) for p in files if p.exists())
+
+
+def list_runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:
+    """What the pages list: the runs of MLflow and the portfolio runs of the store (list_virtual_runs), one table, one unique label each."""
+    logged, saved = list_mlflow_runs(tracking_uri, experiment), list_virtual_runs(store_root)
+    if saved.empty:
+        return logged
+    out = pd.concat([logged, saved], ignore_index=True)
+    out["kind"] = out["kind"].fillna("trained")
+    out["display_name"] = _unique_labels(out)
+    return out.sort_values(["train_bars", "name"]).reset_index(drop=True)
+
+
+def is_virtual_run_id(store_run_id: str) -> bool:
+    """A run kept under VirtualRuns/ has '@<portfolio_id>' at the end of its id."""
+    return "@" in store_run_id
+
+
 def parameter_columns(runs: pd.DataFrame) -> list[str]:
     """The logged params that vary between the runs (what is worth grouping or comparing by)."""
     base = {"display_name", "name", "store_run_id", "walk_forward_id", "store_path", "mlflow_run_id"}
@@ -130,7 +175,10 @@ def parameter_columns(runs: pd.DataFrame) -> list[str]:
 # the run store (the data)
 # --------------------------------------------------------------------------------------------------
 
-def load_run(store_run_id: str, store_root: str) -> wf.LoadedRun:
+def load_run(store_run_id: str, store_root: str) -> wf.Run:
+    """A saved run (LoadedRun), or a portfolio run kept under VirtualRuns/ (id with '@<portfolio_id>'): StoredVirtualRun | StoredBaselineRun."""
+    if is_virtual_run_id(store_run_id):
+        return rs.load_virtual_run(store_run_id, Path(store_root))
     return rs.load_walk_forward_run(store_run_id, Path(store_root))
 
 
@@ -235,6 +283,13 @@ def ticker_variance_frames(run: wf.Run, dates=None) -> dict[str, pd.DataFrame]:
     return frames
 
 
+def ticker_returns(run: wf.Run) -> pd.DataFrame:
+    """The simple return of every ticker of a long / ewma-family run on its forecast days (days x tickers, fractions): what any weights are applied to."""
+    tickers = run.config["setting"]["tickers"]
+    bank = run.ewma_bank
+    return core.return_to_percent(bank[[f"return_{ticker}" for ticker in tickers]].set_axis(tickers, axis=1), run.unit)
+
+
 def ticker_variance_summary(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Per ticker: mean variances, the ratio model / EWMA and the correlation of the two."""
     rows = {}
@@ -336,14 +391,27 @@ def variance_baselines(
     return frame.loc[frame.index.intersection(dates)]
 
 
-def feature_importance(run: wf.LoadedRun) -> pd.DataFrame | None:
-    path = run.run_dir / "models" / "feature_importance.parquet"
-    return pd.read_parquet(path) if path.exists() else None
+def _models_folder(run: wf.Run) -> Path | None:
+    """
+    The folder of the saved models of a run: its own, or, for a portfolio run read off another run's per-ticker forecasts (the models do not depend on the
+    weights), the base run's. None when no models are kept (a baseline kept under VirtualRuns/ is its residuals only, a training that is not saved has none).
+    """
+    if isinstance(run, wf.ReweightedVirtualRun):
+        return _models_folder(run.base)
+    run_dir = getattr(run, "run_dir", None)
+    return None if run_dir is None else run_dir / "models"
 
 
-def garch_params(run: wf.LoadedRun) -> pd.DataFrame | None:
-    path = run.run_dir / "models" / "garch_params.json"
-    if not path.exists():
+def feature_importance(run: wf.Run) -> pd.DataFrame | None:
+    folder = _models_folder(run)
+    path = None if folder is None else folder / "feature_importance.parquet"
+    return pd.read_parquet(path) if path is not None and path.exists() else None
+
+
+def garch_params(run: wf.Run) -> pd.DataFrame | None:
+    folder = _models_folder(run)
+    path = None if folder is None else folder / "garch_params.json"
+    if path is None or not path.exists():
         return None
     params = rs._read_json(path)
     first = next(iter(params.values()))
