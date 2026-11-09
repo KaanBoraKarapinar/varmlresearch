@@ -157,7 +157,7 @@ def _run_fetch(root: Path, bucket: str, settings: dict[str, str | None], numbers
         store = rso.open_store(bucket, settings)
         rso.sync(root, store, is_on_demand=is_on_demand, progress=lambda *counted: numbers.__setitem__(slice(None), counted))
         rso.enable_on_demand(rso.OnDemand(root, store, announce=st.spinner))      # the spinner is drawn when a page reads a big file, in the script thread
-    except (OSError, ValueError) as error:      # no settings, no manifest, a file that fails its check, the bucket not reachable
+    except (OSError, ValueError) as error:      # no keys, an empty bucket, a file that fails its size check, the bucket not reachable
         failure.append(error)
 
 

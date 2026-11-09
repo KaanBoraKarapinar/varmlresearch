@@ -2,12 +2,12 @@
 Put the run store (store/ and mlruns.db) into the bucket the dashboard fetches it from (core/remote_store.py).
 
     python training/upload_store.py --dry-run      what would be put (nothing is sent)
-    python training/upload_store.py                put what is new or changed, then the manifest
+    python training/upload_store.py                put what is not in the bucket yet or has another size there
 
 The remote is --remote, else the setting STORE_REMOTE, else the project's bucket (core/remote_store.py, PROJECT_REMOTE): "s3://<bucket>/<prefix>" or the path of a
 folder. A bucket needs the keys S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY (a WRITE key here), read from the environment and from the .env file of the project root;
 they are never printed.
-Nothing is deleted in the bucket. Start it again after every new run: the dashboard only knows what the manifest lists.
+Nothing is deleted in the bucket. Start it again after every new run: the dashboard reads what the bucket holds when it fetches.
 """
 
 from __future__ import annotations

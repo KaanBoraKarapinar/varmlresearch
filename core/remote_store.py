@@ -1,22 +1,22 @@
 """
 The run store kept in an object store (a bucket), so that a machine without the store (the deployed dashboard) can fetch it.
 
-What is kept there, relative to the project root: the folder store/ and the MLflow index mlruns.db, plus a manifest.json that lists every file with its size
-and sha256. The bucket is an S3 API bucket (Cloudflare R2, Backblaze B2, Storj, AWS ...) or, for a mounted disk or a test, a plain folder.
+What is kept there, relative to the project root: the folder store/ and the MLflow index mlruns.db. The bucket is an S3 API bucket (Cloudflare R2, Backblaze B2,
+Storj, AWS ...) or, for a mounted disk or a test, a plain folder. What is in it is read from the bucket itself (its listing: every file with its size); there is
+no index file to keep up to date.
 
-    upload(root, store)     put what is new or changed (compared by the manifest) and then the manifest (so a half-finished upload leaves the old one)
+    upload(root, store)     put what is new or has another size in the bucket
     sync(root, store)       fetch what is missing on this machine, except the files the caller names on demand; a file that is already there is never overwritten
                             (the local store may be newer than the bucket)
     OnDemand                fetches those big files one by one when they are first read (ensure / ensure_folder / exists, called by the readers)
 
-Neither deletes anything. The remote is named by one string, see open_store: "s3://<bucket>/<prefix>" or the path of a folder. The progress callbacks are called
+Neither deletes anything. A file that was changed to exactly the same size is not noticed by upload (the runs of the store are written once, so this does not
+happen in practice). The remote is named by one string, see open_store: "s3://<bucket>/<prefix>" or the path of a folder. The progress callbacks are called
 from worker threads (one at a time): a caller that draws must only record the numbers there.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import shutil
 import threading
@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-MANIFEST_KEY = "manifest.json"
 KEPT = ("store", "mlruns.db")               # what the bucket holds, relative to the project root
 IGNORED_NAMES = {".DS_Store"}
 S3_SETTINGS = ("S3_ENDPOINT_URL", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION")    # what an s3:// remote needs besides its name
@@ -37,14 +36,12 @@ PROJECT_REMOTE = "s3://varprojectbucket/MLProject-standalone"
 PROJECT_ENDPOINT = "https://s3.us-east-005.backblazeb2.com"
 PROJECT_REGION = "us-east-005"
 PROJECT_KEYS = ("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")       # the secrets of the bucket: read only for the dashboard, read and write for upload_store.py
-HASH_CHUNK = 1 << 20
 
 
 class ObjectStore(Protocol):
     def get(self, key: str, target: Path) -> None: ...
     def put(self, key: str, source: Path) -> None: ...
-    def read_text(self, key: str) -> str | None: ...        # None when the key does not exist
-    def write_text(self, key: str, text: str) -> None: ...
+    def list(self) -> dict[str, int]: ...                   # every file under the store's folder / prefix: {key relative to it: size in bytes}
 
 
 class DirStore:
@@ -61,14 +58,8 @@ class DirStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
 
-    def read_text(self, key: str) -> str | None:
-        path = self.folder / key
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
-    def write_text(self, key: str, text: str) -> None:
-        destination = self.folder / key
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
+    def list(self) -> dict[str, int]:
+        return {p.relative_to(self.folder).as_posix(): p.stat().st_size for p in self.folder.rglob("*") if p.is_file()} if self.folder.is_dir() else {}
 
 
 class S3Store:
@@ -90,17 +81,14 @@ class S3Store:
     def put(self, key: str, source: Path) -> None:
         self.client.upload_file(str(source), self.bucket, self._key(key))
 
-    def read_text(self, key: str) -> str | None:
-        from botocore.exceptions import ClientError
-        try:
-            return self.client.get_object(Bucket=self.bucket, Key=self._key(key))["Body"].read().decode("utf-8")
-        except ClientError as error:
-            if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
-                return None
-            raise
-
-    def write_text(self, key: str, text: str) -> None:
-        self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=text.encode("utf-8"), ContentType="application/json")
+    def list(self) -> dict[str, int]:
+        start = f"{self.prefix}/" if self.prefix else ""
+        found: dict[str, int] = {}
+        for page in self.client.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=start):
+            for entry in page.get("Contents", []):
+                if not entry["Key"].endswith("/"):                  # a "folder" placeholder is not a file
+                    found[entry["Key"][len(start):]] = entry["Size"]
+        return found
 
 
 def project_settings(secrets: Mapping[str, str | None]) -> dict[str, str | None]:
@@ -125,41 +113,30 @@ def open_store(remote: str, settings: Mapping[str, str | None]) -> ObjectStore:
 
 
 # --------------------------------------------------------------------------------------------------
-# the manifest
+# what is where
 # --------------------------------------------------------------------------------------------------
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def local_files(root: Path) -> list[str]:
-    """The files of the project that the bucket holds, as posix paths relative to root, sorted."""
-    found = []
+def local_files(root: Path) -> dict[str, int]:
+    """{path relative to root (posix): size} of the files of the project that the bucket holds."""
+    root, found = Path(root), {}
     for name in KEPT:
-        path = Path(root) / name
+        path = root / name
         if path.is_file():
-            found.append(name)
+            found[name] = path.stat().st_size
         elif path.is_dir():
-            found += [p.relative_to(root).as_posix() for p in path.rglob("*") if p.is_file() and p.name not in IGNORED_NAMES]
-    return sorted(found)
+            found.update({p.relative_to(root).as_posix(): p.stat().st_size for p in path.rglob("*") if p.is_file() and p.name not in IGNORED_NAMES})
+    return dict(sorted(found.items()))
 
 
-def local_manifest(root: Path, workers: int = 8) -> dict[str, dict]:
-    """{relative path: {"size", "sha256"}} of the local files."""
-    root = Path(root)
-    with ThreadPoolExecutor(workers) as pool:
-        hashes = list(pool.map(lambda rel: _sha256(root / rel), local_files(root)))
-    return {rel: {"size": (root / rel).stat().st_size, "sha256": digest} for rel, digest in zip(local_files(root), hashes)}
+def remote_files(store: ObjectStore) -> dict[str, int]:
+    """{path: size} of the files in the bucket that belong to the store (store/ and mlruns.db; whatever else is under the prefix is not looked at)."""
+    return {
+        rel: size for rel, size in sorted(store.list().items())
+        if rel.split("/")[0] in KEPT and rel.rsplit("/", 1)[-1] not in IGNORED_NAMES
+    }
 
 
-def remote_manifest(store: ObjectStore) -> dict[str, dict]:
-    """The manifest in the bucket ({} when there is none yet)."""
-    text = store.read_text(MANIFEST_KEY)
-    return {} if text is None else json.loads(text)["files"]
+NOTHING_THERE = "The bucket has no store/ or mlruns.db under its prefix: upload the store first (training/upload_store.py)."
 
 
 # --------------------------------------------------------------------------------------------------
@@ -174,11 +151,11 @@ class UploadResult:
 
 
 def upload(root: Path, store: ObjectStore, *, dry_run: bool = False, workers: int = 8, progress: Callable[[int, int], None] | None = None) -> UploadResult:
-    """Put the files that are new or changed (size or sha256 differ from the bucket's manifest), then the manifest. dry_run: only say what would be put."""
+    """Put the files that are not in the bucket or have another size there. dry_run: only say what would be put."""
     root = Path(root)
-    local, remote = local_manifest(root, workers), remote_manifest(store)
-    todo = [rel for rel, entry in local.items() if remote.get(rel) != entry]
-    result = UploadResult(uploaded=todo, unchanged=len(local) - len(todo), bytes=sum(local[rel]["size"] for rel in todo))
+    local, remote = local_files(root), remote_files(store)
+    todo = [rel for rel, size in local.items() if remote.get(rel) != size]
+    result = UploadResult(uploaded=todo, unchanged=len(local) - len(todo), bytes=sum(local[rel] for rel in todo))
     if dry_run or not todo:
         return result
     done, lock = 0, threading.Lock()
@@ -192,8 +169,7 @@ def upload(root: Path, store: ObjectStore, *, dry_run: bool = False, workers: in
                 progress(done, len(todo))
 
     with ThreadPoolExecutor(workers) as pool:
-        list(pool.map(put, todo))                       # list(): an exception of a put is raised here, before the manifest is written
-    store.write_text(MANIFEST_KEY, json.dumps({"files": local}, indent=0))
+        list(pool.map(put, todo))                       # list(): an exception of a put is raised here
     return result
 
 
@@ -206,15 +182,15 @@ class SyncResult:
     bytes: int = 0
 
 
-def _fetch_file(root: Path, store: ObjectStore, rel: str, entry: Mapping) -> None:
-    """One file of the manifest to its place: to <name>.part, checked against the manifest's size and sha256, then moved into place (no half file under its real name)."""
+def _fetch_file(root: Path, store: ObjectStore, rel: str, size: int) -> None:
+    """One file of the bucket to its place: to <name>.part, checked against its size in the bucket, then moved into place (no half file under its real name)."""
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".part")
     store.get(rel, partial)
-    if partial.stat().st_size != entry["size"] or _sha256(partial) != entry["sha256"]:
+    if partial.stat().st_size != size:
         partial.unlink()
-        raise OSError(f"{rel} came back from the bucket with another size or hash than its manifest entry: not kept.")
+        raise OSError(f"{rel} came back from the bucket with another size than the bucket lists ({size} bytes): not kept.")
     os.replace(partial, path)
 
 
@@ -222,34 +198,34 @@ def sync(
     root: Path, store: ObjectStore, *, is_on_demand: Callable[[str], bool], workers: int = 8, progress: Callable[[int, int, int, int], None] | None = None,
 ) -> SyncResult:
     """
-    Fetch the files of the bucket's manifest that are not on this machine, except those that is_on_demand(path relative to root) names: they stay in the bucket
-    until OnDemand fetches them (pass `lambda rel: False` to fetch everything). A file that is there is not touched (a local one with another size is only
-    reported). progress(files done, files to fetch, bytes done, bytes to fetch).
+    Fetch the files of the bucket that are not on this machine, except those that is_on_demand(path relative to root) names: they stay in the bucket until
+    OnDemand fetches them (pass `lambda rel: False` to fetch everything). A file that is there is not touched (a local one with another size is only reported).
+    progress(files done, files to fetch, bytes done, bytes to fetch).
     """
     root = Path(root)
-    manifest = remote_manifest(store)
-    if not manifest:
-        raise FileNotFoundError(f"The bucket has no {MANIFEST_KEY}: upload the store first (training/upload_store.py).")
+    files = remote_files(store)
+    if not files:
+        raise FileNotFoundError(NOTHING_THERE)
     result, todo = SyncResult(), []
-    for rel, entry in manifest.items():
+    for rel, size in files.items():
         path = root / rel
         if not path.exists():
             if is_on_demand(rel):
                 result.left_on_demand += 1
             else:
                 todo.append(rel)
-        elif path.stat().st_size != entry["size"]:
+        elif path.stat().st_size != size:
             result.differs_from_bucket.append(rel)
         else:
             result.present += 1
-    total_bytes, done, done_bytes, lock = sum(manifest[rel]["size"] for rel in todo), 0, 0, threading.Lock()
+    total_bytes, done, done_bytes, lock = sum(files[rel] for rel in todo), 0, 0, threading.Lock()
 
     def fetch(rel: str) -> None:
         nonlocal done, done_bytes
-        _fetch_file(root, store, rel, manifest[rel])
+        _fetch_file(root, store, rel, files[rel])
         with lock:
             done += 1
-            done_bytes += manifest[rel]["size"]
+            done_bytes += files[rel]
             if progress:
                 progress(done, len(todo), done_bytes, total_bytes)
 
@@ -274,13 +250,13 @@ class OnDemand:
 
     def __init__(self, root: Path, store: ObjectStore, announce: Callable[[str], AbstractContextManager], workers: int = 8):
         self.root, self.store, self.announce, self.workers = Path(root), store, announce, workers
-        self.manifest = remote_manifest(store)
-        if not self.manifest:
-            raise FileNotFoundError(f"The bucket has no {MANIFEST_KEY}: upload the store first (training/upload_store.py).")
+        self.files = remote_files(store)
+        if not self.files:
+            raise FileNotFoundError(NOTHING_THERE)
         self._lock = threading.Lock()
 
     def _rel(self, path: Path) -> str | None:
-        """The path relative to the project root, as the manifest writes it; None for a path outside the root."""
+        """The path relative to the project root, as the bucket lists it; None for a path outside the root."""
         try:
             return Path(os.path.abspath(path)).relative_to(os.path.abspath(self.root)).as_posix()
         except ValueError:
@@ -288,29 +264,29 @@ class OnDemand:
 
     def has(self, path: Path) -> bool:
         """On this machine or in the bucket."""
-        return Path(path).exists() or self._rel(path) in self.manifest
+        return Path(path).exists() or self._rel(path) in self.files
 
     def fetch(self, path: Path) -> None:
         """The file, when it is in the bucket and not here; nothing otherwise (the reader then finds what it always finds: the file, or its own error)."""
         rel = self._rel(path)
-        if rel in self.manifest:
+        if rel in self.files:
             self._fetch_missing([rel], Path(path).name)
 
     def fetch_folder(self, folder: Path) -> None:
         """Every file of the bucket under this folder that is not here."""
         rel = self._rel(folder)
         if rel is not None:
-            self._fetch_missing([name for name in self.manifest if name.startswith(rel + "/")], Path(folder).name)
+            self._fetch_missing([name for name in self.files if name.startswith(rel + "/")], Path(folder).name)
 
     def _fetch_missing(self, rels: list[str], name: str) -> None:
         with self._lock:
             missing = [rel for rel in rels if not (self.root / rel).exists()]
             if not missing:
                 return
-            megabytes = sum(self.manifest[rel]["size"] for rel in missing) / 1e6
+            megabytes = sum(self.files[rel] for rel in missing) / 1e6
             with self.announce(f"Loading {name} from the store ({len(missing)} file{'s' if len(missing) > 1 else ''}, {megabytes:,.0f} MB) ..."):
                 with ThreadPoolExecutor(self.workers) as pool:
-                    list(pool.map(lambda rel: _fetch_file(self.root, self.store, rel, self.manifest[rel]), missing))
+                    list(pool.map(lambda rel: _fetch_file(self.root, self.store, rel, self.files[rel]), missing))
 
 
 _on_demand: OnDemand | None = None
