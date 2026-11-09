@@ -19,6 +19,7 @@ store root), there is no default.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -172,24 +173,49 @@ def read_definitions(root: Path, walk_forward_id: str, model: str) -> dict[str, 
     return found
 
 
-def list_definitions(root: Path, walk_forward_id: str) -> list[dict]:
-    """Every saved run of the walk-forward, oldest first: its definition + portfolio_id + model (the run name) + created_at."""
+def _ledger_stamp(root: Path, walk_forward_id: str) -> tuple[str, str, int, int]:
+    """(root, walk-forward, modified time, size) of the ledger: a cache key that changes when an event is appended (0, 0 when there is no ledger)."""
+    path = virtual_runs_dir(root, walk_forward_id) / LEDGER_FILE
+    stat = path.stat() if path.exists() else None
+    return str(root), walk_forward_id, stat.st_mtime_ns if stat else 0, stat.st_size if stat else 0
+
+
+@functools.lru_cache(maxsize=4)
+def _definitions(root: str, walk_forward_id: str, mtime_ns: int, size: int) -> tuple[dict, ...]:
+    """
+    Every saved run of the walk-forward, oldest first. The ledger (19 MB in the store of this project) is read once for as long as it does not change: a page that
+    loads a few hundred saved runs asks for one definition each, and read it again for every one of them before.
+    """
     found: dict[tuple[str, str], dict] = {}
-    for event in read_ledger(root, walk_forward_id):
+    for event in read_ledger(Path(root), walk_forward_id):
         if event.get("event") == "write" and event["dataset"] == RESIDUALS_DATASET and event.get("status", "active") == "active":
             for portfolio, definition in event.get("definitions", {}).items():
                 found[(event["model"], portfolio)] = {
                     **definition, "portfolio_id": portfolio, "model": event["model"], "created_at": event["created_at"],
                 }
-    return list(found.values())
+    return tuple(found.values())
+
+
+@functools.lru_cache(maxsize=4)
+def _definitions_by_run_id(root: str, walk_forward_id: str, mtime_ns: int, size: int) -> dict[str, dict]:
+    by_run_id: dict[str, dict] = {}
+    for definition in _definitions(root, walk_forward_id, mtime_ns, size):
+        if "run_id" in definition:
+            by_run_id.setdefault(definition["run_id"], definition)       # the first one, as a search from the oldest would find
+    return by_run_id
+
+
+def list_definitions(root: Path, walk_forward_id: str) -> list[dict]:
+    """Every saved run of the walk-forward, oldest first: its definition + portfolio_id + model (the run name) + created_at."""
+    return [dict(definition) for definition in _definitions(*_ledger_stamp(root, walk_forward_id))]
 
 
 def find_definition(root: Path, walk_forward_id: str, run_id: str) -> dict:
     """The definition (see list_definitions) of the saved run with this run_id; KeyError when there is none."""
-    for definition in list_definitions(root, walk_forward_id):
-        if definition.get("run_id") == run_id:
-            return definition
-    raise KeyError(f"no saved virtual run {run_id} in {walk_forward_id}.")
+    definition = _definitions_by_run_id(*_ledger_stamp(root, walk_forward_id)).get(run_id)
+    if definition is None:
+        raise KeyError(f"no saved virtual run {run_id} in {walk_forward_id}.")
+    return dict(definition)
 
 
 def walk_forward_ids_with_virtual_runs(root: Path) -> list[str]:
