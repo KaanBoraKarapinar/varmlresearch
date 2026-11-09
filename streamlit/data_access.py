@@ -85,11 +85,18 @@ def password_is_right(entered: str, expected: str) -> bool:
 
 
 class _Fetch:
-    """The fetch of the store, once per process: the first visitor with the password fetches, the others wait for it."""
+    """
+    The fetch of the store, once per process, by ONE worker thread. A visitor's script is stopped and started again whenever a widget changes (and a second visitor has
+    a script of their own): each of them attaches to the worker that is running and draws its progress, none starts another. A thread cannot be stopped from outside,
+    so a worker that a stopped script had started goes on, and a new one beside it would fetch the same files at the same time.
+    """
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()            # only for starting the worker
         self.done = False
+        self.worker: threading.Thread | None = None
+        self.numbers = [0, 0, 0, 0]             # files done, files to fetch, bytes done, bytes to fetch: written by the worker, drawn by a script thread
+        self.failure: list[Exception] = []
 
 
 @st.cache_resource
@@ -130,35 +137,34 @@ def _fetch_store(root: Path, bucket: str) -> None:
     if state.done:
         return
     bar = st.progress(0.0, text="Connecting to the store ...")
-    numbers = [0, 0, 0, 0]          # files done, files to fetch, bytes done, bytes to fetch: written by the fetching threads, drawn by this one (only a script thread may draw)
-    failure: list[Exception] = []
-
-    with state.lock:                       # a second visitor waits here and finds the store fetched
-        if not state.done:
+    with state.lock:
+        if state.worker is None or (not state.worker.is_alive() and state.failure):      # not started yet, or the last try failed: start it (again)
+            state.failure.clear()
+            state.numbers[:] = [0, 0, 0, 0]
             settings_now = _all_settings()      # read here, in the script thread: st.secrets is not read from another one
-            worker = threading.Thread(target=lambda: _run_fetch(root, bucket, settings_now, numbers, failure))
-            worker.start()
-            while worker.is_alive():
-                done, files, done_bytes, total_bytes = numbers
-                bar.progress(done_bytes / total_bytes if total_bytes else 0.0, text=f"Loading the data: {done}/{files} files, {done_bytes / 1e6:,.0f} of {total_bytes / 1e6:,.0f} MB")
-                time.sleep(0.2)
-            worker.join()
-            if failure:
-                bar.empty()
-                st.error(f"The data could not be loaded from the store: {failure[0]}")
-                st.stop()
-            state.done = True
+            state.worker = threading.Thread(target=_run_fetch, args=(state, root, bucket, settings_now), daemon=True)
+            state.worker.start()
+        worker = state.worker
+    while worker.is_alive():                    # only a script thread may draw
+        done, files, done_bytes, total_bytes = state.numbers
+        bar.progress(done_bytes / total_bytes if total_bytes else 0.0, text=f"Loading the data: {done}/{files} files, {done_bytes / 1e6:,.0f} of {total_bytes / 1e6:,.0f} MB")
+        time.sleep(0.2)
+    worker.join()
     bar.empty()
+    if state.failure:
+        st.error(f"The data could not be loaded from the store: {state.failure[0]}")
+        st.stop()
 
 
-def _run_fetch(root: Path, bucket: str, settings: dict[str, str | None], numbers: list[int], failure: list[Exception]) -> None:
-    """The fetch itself, in a thread of its own: it touches no Streamlit call (the settings are read before it starts), only the numbers it reports."""
+def _run_fetch(state: _Fetch, root: Path, bucket: str, settings: dict[str, str | None]) -> None:
+    """The fetch itself, in a thread of its own: it touches no Streamlit call (the settings are read before it starts), only the numbers and the result it reports."""
     try:
         store = rso.open_store(bucket, settings)
-        rso.sync(root, store, is_on_demand=is_on_demand, progress=lambda *counted: numbers.__setitem__(slice(None), counted))
+        rso.sync(root, store, is_on_demand=is_on_demand, progress=lambda *counted: state.numbers.__setitem__(slice(None), counted))
         rso.enable_on_demand(rso.OnDemand(root, store, announce=st.spinner))      # the spinner is drawn when a page reads a big file, in the script thread
-    except (OSError, ValueError) as error:      # no keys, an empty bucket, a file that fails its size check, the bucket not reachable
-        failure.append(error)
+        state.done = True
+    except Exception as error:      # whatever it is (no keys, an empty bucket, a file that fails its size check, the bucket not reachable): the page shows it, a thread's own would be lost
+        state.failure.append(error)
 
 
 def require_data(root: Path) -> None:

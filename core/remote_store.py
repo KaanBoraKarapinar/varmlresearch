@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -186,7 +187,7 @@ def _fetch_file(root: Path, store: ObjectStore, rel: str, size: int) -> None:
     """One file of the bucket to its place: to <name>.part, checked against its size in the bucket, then moved into place (no half file under its real name)."""
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(path.name + ".part")
+    partial = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.part")      # its own name: two fetches of the same file at once never meet on one partial file
     store.get(rel, partial)
     if partial.stat().st_size != size:
         partial.unlink()
