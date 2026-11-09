@@ -1,0 +1,25 @@
+{
+  "recipe": {
+    "__class__": "walk_forward.ModelRecipe",
+    "default_mu_hat": 0.0,
+    "ewma_lam": 0.94,
+    "ewma_min_periods": 30,
+    "features": null,
+    "model_family": "historical",
+    "model_format": "wide",
+    "model_kwargs": {},
+    "mu_mode": "constant",
+    "pretrained_from": null,
+    "rolling_mu_hat_window_size": null,
+    "target": null
+  },
+  "recipe_key": "b0fd4b8a",
+  "run_name": "historical",
+  "versions": {
+    "arch": "8.0.0",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "xgboost": "3.4.1"
+  }
+}

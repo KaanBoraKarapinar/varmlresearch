@@ -32,6 +32,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from . import remote_store
 from .ResidualBank import RESIDUAL_COLS
 
 VIRTUAL_RUNS_DIR = "VirtualRuns"
@@ -220,6 +221,7 @@ def read_residuals(root: Path, walk_forward_id: str, model: str, portfolio: str)
     indexed by Date in time order. KeyError when the portfolio is not written for the model.
     """
     folder = _model_dir(root, walk_forward_id, RESIDUALS_DATASET, model)
+    remote_store.ensure_folder(folder)               # a deployed dashboard leaves the residual files in the bucket until a model is read
     files = sorted(folder.glob("part-*.parquet"), key=lambda p: int(_PART_FILE.fullmatch(p.name).group(1))) if folder.exists() else []
     if not files:
         raise KeyError(f"no residuals of model {model!r} in {walk_forward_id}.")

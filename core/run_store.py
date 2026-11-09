@@ -266,7 +266,7 @@ def _write_raw_residual_banks(folder: Path, fits: list[wf.WalkForwardSingleCalen
 def _write_ewma(run_dir: Path, fits: list[wf.WalkForwardSingleCalendarFit], metadata: dict, keep_raw: bool = True) -> None:
     if fits[0].ewma_bank is None:
         return
-    _to_parquet(wf.build_combined_ewma_bank_WITHOUT_CALC(fits), run_dir / "WALK_FORWARD_EWMA_BANK.parquet", metadata)
+    _to_parquet(wf.build_combined_ewma_bank_WITHOUT_CALC(fits), run_dir / wf.EWMA_BANK_FILE, metadata)
     _to_parquet(wf.build_first_window_training_bank(fits), run_dir / wf.FIRST_WINDOW_TRAINING_BANK_FILE, metadata)
     if not keep_raw:
         return

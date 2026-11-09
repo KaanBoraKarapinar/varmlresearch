@@ -1,0 +1,20 @@
+{
+  "features": {
+    "__class__": "feature_blocks.FeatureSpec",
+    "blocks": {
+      "__tuple__": [
+        {
+          "__class__": "feature_blocks.LogRvHar",
+          "month": 22,
+          "week": 5
+        }
+      ]
+    },
+    "unit": "percent"
+  },
+  "target": {
+    "__class__": "targets.LogRealizedVariance",
+    "scale": 1.0,
+    "unit": "percent"
+  }
+}

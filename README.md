@@ -338,6 +338,9 @@ python training/train_feature_target_grid.py       # one walk-forward (23 ticker
 python training/train_horizon_grid.py --workers 8  # the training window x daily refit grid, trained in parallel
 python training/train_har_rv_baseline.py           # the HAR-RV regression as a run of the same pipeline
 
+python training/upload_store.py --dry-run          # what would be put into the bucket (store/ and mlruns.db); without --dry-run it puts it
+python training/build_results_cache.py             # results_cache/: the part of the store the Results and Experiments pages show without the bucket (remove the folder first to make it again)
+
 streamlit run streamlit/dashboard.py               # the dashboard
 ```
 
@@ -356,6 +359,8 @@ Every training script documents its options in its first lines (`--dry-run` list
 | Model comparison with user defined weights | the models and the baselines for weights you give, or for a saved portfolio (Load portfolio) |
 
 The left panel sets how the VaR is read from the saved residuals (confidence, residual window, minimum periods, test confidence).
+
+**Deployed without the store.** The store is kept in an S3 API bucket (`core/remote_store.py`, filled by `training/upload_store.py`). When the setting `STORE_REMOTE` is set (`s3://<bucket>/<prefix>`, with the bucket's `S3_*` settings), Approach, Results and Experiments (at the reading of the saved experiments) are shown without a password from the results cache in the repository (`results_cache/`, about 40 MB: the files of the saved experiments, made by `training/build_results_cache.py`, which is started again after a new experiment or run). The other pages, another VaR reading in the left panel and the per ticker variance tab ask for the password (`DASHBOARD_PASSWORD`) and then fetch the store once, without its big files (about 130 of the 1,100 MB): the per ticker banks of a run and the residuals of the saved portfolio runs are fetched one by one when a page first reads them. The password only saves the bucket's bandwidth, it hides nothing. Without `STORE_REMOTE` the store is local and nothing is asked. The settings are read from the environment, from the `.env` file and from `.streamlit/secrets.toml` (neither is tracked; `.streamlit/secrets.toml.example` lists them). The password is never in the code.
 
 ## The run store
 

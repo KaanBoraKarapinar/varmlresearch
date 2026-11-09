@@ -1,0 +1,239 @@
+{
+  "code": {
+    "diff": "diff --git a/core/run_store.py b/core/run_store.py\nindex 1b5882e..a311811 100644\n--- a/core/run_store.py\n+++ b/core/run_store.py\n@@ -25,6 +25,8 @@ read off the combined residuals (it is an argument of the evaluation, not part o\n \n     train_and_save_walk_forward_run(setting, recipe, name)   train + save (or reuse an identical run)\n     load_walk_forward_run(run_id)                            -> LoadedRun\n+    save_virtual_run(virtual) / save_baseline_runs(setting, weights)   a portfolio's runs kept under <walk_forward>/VirtualRuns/ (residuals only)\n+    load_virtual_run(run_id)                                 -> StoredVirtualRun | StoredBaselineRun\n     trained_initial_run(setting, recipe, fits, name)         -> TrainedInitialRun (a training that is not saved)\n     runs_table / load_runs                                   select runs by params\n     leaderboard / common_dates / factor_table / window_matrix / explain_window / explain_day / exceedance_days\n@@ -33,10 +35,12 @@ read off the combined residuals (it is an argument of the evaluation, not part o\n \n from __future__ import annotations\n \n+import contextlib\n import dataclasses\n import datetime\n import hashlib\n import importlib.metadata\n+import io\n import json\n import shutil\n import subprocess\n@@ -49,6 +53,8 @@ import core\n from core import EwmaVarianceBank\n from core import walk_forward as wf\n from core.ResidualBank import RESIDUAL_COLS\n+from core import portfolios\n+from core import virtual_runs as vr\n # the run read back from disk is walk_forward.LoadedRun; run_store keeps the layout on disk, the saving and the views over runs\n from core.walk_forward import (\n     LoadedRun, Reading, Run, _calendar_name, _json_default, _parquet_metadata, _read_json, _to_parquet, _write_json,\n@@ -427,6 +433,161 @@ def load_walk_forward_run(run_id: str, root: Path = STORE_ROOT) -> LoadedRun:\n     return LoadedRun(run_dir)\n \n \n+def save_virtual_run(\n+    virtual: wf.ReweightedVirtualRun, root: Path = STORE_ROOT, batch: dict | None = None,\n+    name: str | None = None, tags: dict | None = None, name_prefix: str | None = None,\n+) -> str:\n+    \"\"\"\n+    Keep a ReweightedVirtualRun: its combined residuals go to <walk_forward>/VirtualRuns/ (core.virtual_runs), with the weights and the run\n+    it was read from, so load_virtual_run opens it later with any VaR reading. The portfolio is registered (core.portfolios) under `name`\n+    (None: described by its weights, after `name_prefix`) with its `tags`, and the run is linked to it; the registry is checked first, so a\n+    name that is taken writes nothing.\n+    A portfolio of a base run is kept once: saving it again changes nothing. batch: free provenance for the ledger.\n+    Returns the run_id (<base run_id>@<portfolio_id>).\n+    \"\"\"\n+    weights = {ticker: float(w) for ticker, w in zip(virtual.tickers, virtual.weights)}\n+    portfolios.register_portfolio(root, weights, name, tags, name_prefix)\n+    return save_virtual_runs([virtual], root, batch)[0]\n+\n+\n+def _ledger_config(config: dict) -> dict:\n+    \"\"\"\n+    A run's model_settings for the ledger: JSON values, without the git diff of the code (it is the size of the working tree's uncommitted changes,\n+    ~100 KB in every ledger line); the commit and whether the tree was dirty stay.\n+    \"\"\"\n+    config = json.loads(json.dumps(config, default=_json_default))\n+    if \"code\" in config:\n+        config[\"code\"] = {k: v for k, v in config[\"code\"].items() if k != \"diff\"}\n+    return config\n+\n+\n+def save_virtual_runs(virtuals: list[wf.ReweightedVirtualRun], root: Path = STORE_ROOT, batch: dict | None = None) -> list[str]:\n+    \"\"\"\n+    Keep the virtual runs of SEVERAL portfolios at once: the portfolios of one base run go into ONE new part file (not a file per portfolio), which\n+    is what keeps a few hundred portfolios at a few files per model. The portfolios have to be registered already (save_virtual_run registers one; the\n+    label of a run carries the registered name). A run that is already kept is not written again. Returns the run_ids in the order given.\n+    \"\"\"\n+    groups: dict[tuple[str, str], list[wf.ReweightedVirtualRun]] = {}\n+    for virtual in virtuals:\n+        groups.setdefault((virtual.base.walk_forward_id, virtual.base.name), []).append(virtual)\n+    records = portfolios.portfolios_by_id(root)\n+    links = []\n+    for (walk_forward_id, model), members in groups.items():\n+        kept = set(vr.portfolio_ids(root, walk_forward_id, model))\n+        frames, definitions = {}, {}\n+        for virtual in members:\n+            weights = {ticker: float(w) for ticker, w in zip(virtual.tickers, virtual.weights)}\n+            portfolio = vr.portfolio_id(weights)\n+            if portfolio not in records:\n+                raise KeyError(f\"portfolio {portfolio} is not registered: register it first (core.portfolios.register_portfolio).\")\n+            links.append((portfolio, virtual.run_id, \"reweighted\"))\n+            if portfolio in kept or portfolio in frames:\n+                continue\n+            labelled = wf.ReweightedVirtualRun(virtual.base, weights, records[portfolio])      # the run as the dashboard lists it: its label carries the portfolio name\n+            frames[portfolio] = virtual.combined_residuals\n+            definitions[portfolio] = {\n+                \"kind\": \"reweighted\", \"run_id\": virtual.run_id, \"weights\": weights, \"base_run_id\": virtual.base.run_id,\n+                \"config\": _ledger_config(labelled.config),\n+            }\n+        if frames:\n+            vr.save_residuals(root, walk_forward_id, model, frames, batch=batch, definitions=definitions)\n+    portfolios.link_runs(root, links)\n+    return [virtual.run_id for virtual in virtuals]\n+\n+\n+def save_baseline_runs(\n+    base_setting: wf.WalkForwardSetting, weights: dict[str, float], root: Path = STORE_ROOT,\n+    names: tuple[str, ...] = (\"garch_wide\", \"historical\"), name: str | None = None, tags: dict | None = None,\n+    name_prefix: str | None = None, batch: dict | None = None,\n+) -> dict[str, str]:\n+    \"\"\"\n+    Train baselines (wf.BASELINE_RECIPES) for ONE portfolio: base_setting with these weights, its windows and data. They depend on the portfolio's own\n+    return, so they are trained again for every portfolio, and only their combined residuals are kept, under the BASE walk-forward's VirtualRuns/\n+    (core.virtual_runs): no folder per portfolio, no per-window files. The recipes are kept once as VirtualRuns/BaselineModelDefs/<name>.json and the\n+    complete model_settings of each run in the ledger, so a run can be read, listed and, if wanted, trained again as a full run.\n+    A baseline already kept for the portfolio is not trained again. Returns {run name: run_id}, run_id = <base walk-forward>/<ft key>/<model dir>@<portfolio_id>.\n+    \"\"\"\n+    record = portfolios.register_portfolio(root, weights, name, tags, name_prefix)\n+    return save_baseline_runs_for(base_setting, [record], root, names, batch)[record[\"portfolio_id\"]]\n+\n+\n+def save_baseline_runs_for(\n+    base_setting: wf.WalkForwardSetting, records: list[dict], root: Path = STORE_ROOT,\n+    names: tuple[str, ...] = (\"garch_wide\", \"historical\"), batch: dict | None = None,\n+) -> dict[str, dict[str, str]]:\n+    \"\"\"\n+    save_baseline_runs for SEVERAL registered portfolios (records: their registry records, core.portfolios): each baseline is trained for every portfolio\n+    that does not have it yet and the residuals of ALL of them are written together, ONE new part file per baseline, so a few hundred portfolios stay\n+    at a few files per baseline. Nothing is written until the baselines of every portfolio are trained: the number of portfolios per call is the\n+    size of what an interruption loses. Returns {portfolio_id: {run name: run_id}}.\n+    \"\"\"\n+    unknown = [n for n in names if n not in wf.BASELINE_RECIPES]\n+    if unknown:\n+        raise ValueError(f\"unknown baselines {unknown}; known: {list(wf.BASELINE_RECIPES)}.\")\n+    base_id = base_setting.walk_forward_id\n+    save_walk_forward(base_setting, root)               # the walk-forward folder with its windows (an existing one must hold the same inputs)\n+    run_ids = {\n+        record[\"portfolio_id\"]: {\n+            n: f\"{base_id}/{_feature_target_key(wf.BASELINE_RECIPES[n])}/{_model_dir_name(wf.BASELINE_RECIPES[n])}@{record['portfolio_id']}\" for n in names\n+        } for record in records\n+    }\n+    kept = {n: set(vr.portfolio_ids(root, base_id, n)) for n in names}\n+    frames: dict[str, dict] = {n: {} for n in names}\n+    definitions: dict[str, dict] = {n: {} for n in names}\n+    for record in records:\n+        portfolio = record[\"portfolio_id\"]\n+        todo = [n for n in names if portfolio not in kept[n]]\n+        if not todo:\n+            continue\n+        setting = dataclasses.replace(base_setting, weights={t: float(record[\"weights\"][t]) for t in base_setting.tickers})\n+        with contextlib.redirect_stdout(io.StringIO()):      # the calendars print a line for every market holiday they skip\n+            calendars = setting.make_calendars()\n+        for run_name in todo:\n+            recipe = wf.BASELINE_RECIPES[run_name]\n+            with contextlib.redirect_stdout(io.StringIO()):\n+                fits = wf.train_walk_forward(calendars, recipe)\n+            config = _model_settings(setting, recipe, run_name, fits)\n+            config[\"trained_on_walk_forward_id\"] = config[\"walk_forward_id\"]        # the id a full run for these weights would get\n+            config[\"walk_forward_id\"] = config[\"keys\"][\"walk_forward_id\"] = base_id\n+            config[\"run_id\"] = run_ids[portfolio][run_name]\n+            config[\"display_name\"] = wf._label_with_portfolio(run_name, config[\"display_name\"], record[\"name\"])\n+            config[\"portfolio\"] = {k: record[k] for k in (\"portfolio_id\", \"name\", \"tags\")}\n+            frames[run_name][portfolio] = wf.build_combined_residuals_frame(fits)\n+            definitions[run_name][portfolio] = {\n+                \"kind\": \"trained_baseline\", \"run_id\": run_ids[portfolio][run_name], \"weights\": record[\"weights\"],\n+                \"recipe_key\": _model_key(recipe), \"config\": _ledger_config(config),\n+            }\n+    for run_name in names:\n+        if not frames[run_name]:\n+            continue\n+        recipe = wf.BASELINE_RECIPES[run_name]\n+        vr.ensure_model_definition(root, base_id, run_name, {\n+            \"run_name\": run_name, \"recipe\": config_to_dict(recipe), \"recipe_key\": _model_key(recipe), \"versions\": _versions(),\n+        })\n+        vr.save_residuals(root, base_id, run_name, frames[run_name], batch=batch, definitions=definitions[run_name])\n+    portfolios.link_runs(root, [(portfolio, run_id, \"trained\") for portfolio, by_name in run_ids.items() for run_id in by_name.values()])\n+    return run_ids\n+\n+\n+def load_virtual_run(run_id: str, root: Path = STORE_ROOT) -> wf.Run:\n+    \"\"\"\n+    A run kept under VirtualRuns/ (run_id = <walk_forward>/<ft key>/<model dir>@<portfolio_id>): a StoredVirtualRun (another run's per-ticker\n+    forecasts read for the portfolio's weights, save_virtual_run) or a StoredBaselineRun (a baseline trained for the weights, save_baseline_runs).\n+    \"\"\"\n+    _, separator, portfolio = run_id.rpartition(\"@\")\n+    if not separator or not portfolio:\n+        raise ValueError(f\"{run_id!r} is not a virtual run id (<base run_id>@<portfolio_id>).\")\n+    try:\n+        definition = vr.find_definition(root, run_id.split(\"/\")[0], run_id)\n+    except KeyError:\n+        raise FileNotFoundError(f\"no saved virtual run {run_id} under {root}\") from None\n+    if definition.get(\"kind\") == \"trained_baseline\":\n+        windows = pd.read_parquet(walk_forward_dir(run_id.split(\"/\")[0], root) / \"WindowsCreatedCalendars.parquet\")\n+        return wf.StoredBaselineRun(definition[\"config\"], windows, root, definition[\"model\"])\n+    base = load_walk_forward_run(definition[\"base_run_id\"], root)\n+    return wf.StoredVirtualRun(base, definition[\"weights\"], root, portfolios.get_portfolio(root, portfolio))\n+\n+\n # --------------------------------------------------------------------------------------------------\n # selecting runs and the views\n # --------------------------------------------------------------------------------------------------\ndiff --git a/core/walk_forward.py b/core/walk_forward.py\nindex 3bb3c47..825b380 100644\n--- a/core/walk_forward.py\n+++ b/core/walk_forward.py\n@@ -46,6 +46,7 @@ from core import (\n )\n from core import feature_blocks, targets\n from core.ResidualBank import RESIDUAL_COLS\n+from core.virtual_runs import portfolio_id, read_residuals\n from core.feature_blocks import Returns\n from core.units import return_to_percent\n \n@@ -871,6 +872,8 @@ class Run(ABC):\n       LoadedRun               the sources are the files of a saved run folder (run_store.load_walk_forward_run)\n       TrainedInitialRun       the sources are the fits of a training that has not been saved\n       ReweightedVirtualRun    another run's per-ticker forecasts read for other portfolio weights: nothing is trained, nothing is saved\n+      StoredVirtualRun        a ReweightedVirtualRun whose residuals were saved under VirtualRuns/ and are read from there\n+      StoredBaselineRun       a baseline trained for a portfolio's weights, kept under VirtualRuns/ as its residuals only\n     \"\"\"\n \n     # ---- the sources ----------------------------------------------------------------------------\n@@ -1258,15 +1261,24 @@ def reweight_blocker(run: Run) -> str | None:\n     return None\n \n \n+def _label_with_portfolio(run_name: str, display_name: str, portfolio_name: str) -> str:\n+    \"\"\"'<run name> | train N f M' -> '<run name> | <portfolio name> | train N f M' (the portfolio goes right after the model).\"\"\"\n+    if not display_name.startswith(run_name + \" | \"):\n+        return f\"{display_name} | {portfolio_name}\"\n+    return f\"{run_name} | {portfolio_name}{display_name[len(run_name):]}\"\n+\n+\n class ReweightedVirtualRun(Run):\n     \"\"\"\n     Another run's per-ticker forecasts read for OTHER portfolio weights: Sigma_t = D R D of the stored rows, the residuals, the quantile\n     and the loss are recomputed with the weights given (reweighted_residuals). Nothing is trained and nothing is saved.\n     Exact for GARCH, EWMA and the xgboost models with portable features; reweight_blocker says when it is not.\n     base: any Run with an ewma bank. weights: ticker -> weight for exactly the base's tickers, normalised here.\n+    portfolio: the portfolio's record (core.portfolios: portfolio_id, name, tags ...). With it the label is\n+    '<model> | <portfolio name> | train N f M', without it '<base label> | user defined weights'.\n     \"\"\"\n \n-    def __init__(self, base: Run, weights: dict[str, float]):\n+    def __init__(self, base: Run, weights: dict[str, float], portfolio: dict | None = None):\n         blocker = reweight_blocker(base)\n         if blocker:\n             raise ValueError(f\"{base.display_name} cannot be re-weighted: {blocker}.\")\n@@ -1277,14 +1289,19 @@ class ReweightedVirtualRun(Run):\n         if (w < 0).any() or w.sum() <= 0:\n             raise ValueError(\"weights must be non-negative with a positive sum.\")\n         self.base, self.tickers, self.weights = base, tickers, w / w.sum()\n+        self.portfolio = portfolio\n \n     @cached_property\n     def config(self) -> dict:\n         config = copy.deepcopy(self.base.config)\n         config[\"setting\"][\"weights\"] = {t: float(w) for t, w in zip(self.tickers, self.weights)}\n-        digest = hashlib.sha256(json.dumps({t: round(float(w), 12) for t, w in zip(self.tickers, self.weights)}, sort_keys=True).encode()).hexdigest()[:8]\n+        digest = portfolio_id(dict(zip(self.tickers, self.weights)))\n         config[\"run_id\"] = f\"{self.base.run_id}@{digest}\"\n-        config[\"display_name\"] = f\"{self.base.display_name} | user defined weights\"\n+        if self.portfolio is None:\n+            config[\"display_name\"] = f\"{self.base.display_name} | user defined weights\"\n+        else:\n+            config[\"display_name\"] = _label_with_portfolio(self.base.name, self.base.display_name, self.portfolio[\"name\"])\n+            config[\"portfolio\"] = {k: self.portfolio[k] for k in (\"portfolio_id\", \"name\", \"tags\")}\n         config[\"reweighted_from\"] = self.base.run_id\n         return config\n \n@@ -1342,3 +1359,77 @@ class ReweightedVirtualRun(Run):\n     @cached_property\n     def first_window_training_bank(self) -> pd.DataFrame:\n         return self._with_portfolio_variance(self.base.first_window_training_bank)\n+\n+\n+class StoredVirtualRun(ReweightedVirtualRun):\n+    \"\"\"\n+    A ReweightedVirtualRun whose combined residuals were saved (run_store.save_virtual_run, core.virtual_runs) and are read back from\n+    VirtualRuns/ instead of being rebuilt from the base run's banks: a reading needs only those residuals, so the base's (large) ewma bank\n+    is opened only by the views that explain a day (ewma_bank, first_window_training_bank). Everything else is the ReweightedVirtualRun's.\n+    \"\"\"\n+\n+    def __init__(self, base: Run, weights: dict[str, float], root: Path, portfolio: dict | None = None):\n+        super().__init__(base, weights, portfolio)\n+        self.root = Path(root)\n+\n+    @cached_property\n+    def combined_residuals(self) -> pd.DataFrame:\n+        return read_residuals(\n+            self.root, self.base.walk_forward_id, self.base.name, portfolio_id(dict(zip(self.tickers, self.weights))),\n+        )\n+\n+\n+class StoredBaselineRun(Run):\n+    \"\"\"\n+    A baseline (GARCH, historical) trained for the weights of a portfolio and kept as its combined residuals only\n+    (run_store.save_baseline_runs): it depends on the portfolio's own return, so it cannot be read off another run, and nothing of the model\n+    is kept. Every reading is derived from the residuals, like any run's. It has no ewma bank (wide models do not) and the in-sample QLIKE of\n+    its windows is NaN (only the first window's training days are kept): the QLIKE of the forecast days is rebuilt from the residuals.\n+    config is the model_settings the training gave it (run_id <walk_forward>/none/<model dir>@<portfolio_id>, label '<model> | <portfolio> | train N f M').\n+    \"\"\"\n+\n+    def __init__(self, config: dict, windows: pd.DataFrame, root: Path, model: str):\n+        self._config, self._windows, self.root, self.model = config, windows, Path(root), model\n+\n+    @property\n+    def config(self) -> dict:\n+        return self._config\n+\n+    @property\n+    def windows(self) -> pd.DataFrame:\n+        return self._windows\n+\n+    @cached_property\n+    def combined_residuals(self) -> pd.DataFrame:\n+        return read_residuals(self.root, self.walk_forward_id, self.model, self.config[\"portfolio\"][\"portfolio_id\"])\n+\n+    @cached_property\n+    def window_losses(self) -> pd.DataFrame:\n+        residuals = self.combined_residuals\n+        forecast = residuals[residuals[\"part\"] == \"forecast\"]\n+        r2 = return_to_percent(forecast[\"actual_return\"], self.unit) ** 2\n+        has_variance_forecast = self.params[\"model_family\"] != \"historical\"      # the historical family has none, as in window_losses\n+        rows = {}\n+        for window_id, part in forecast.groupby(\"window_id\"):\n+            rows[window_id] = {\n+                \"train_days\": 0, \"train_qlike\": np.nan, \"forecast_days\": len(part),\n+                \"forecast_qlike\": qlike(part[\"predicted_variance\"], r2.loc[part.index]) if has_variance_forecast else np.nan,\n+                \"train_loss\": np.nan, \"train_loss_days\": 0, \"forecast_loss\": np.nan, \"forecast_loss_days\": 0,\n+            }\n+        return pd.DataFrame(rows).T.rename_axis(\"window_id\")\n+\n+    @property\n+    def has_ewma_bank(self) -> bool:\n+        return False\n+\n+    @property\n+    def ewma_bank(self) -> pd.DataFrame:\n+        raise FileNotFoundError(f\"{self.display_name} has no ewma bank (not a long / ewma run).\")\n+\n+    @property\n+    def has_first_window_training_bank(self) -> bool:\n+        return False\n+\n+    @property\n+    def first_window_training_bank(self) -> pd.DataFrame:\n+        raise FileNotFoundError(f\"{self.display_name} has no first-window training bank (not a long / ewma run).\")\ndiff --git a/streamlit/dashboard_data.py b/streamlit/dashboard_data.py\nindex c4c67ef..ca971df 100644\n--- a/streamlit/dashboard_data.py\n+++ b/streamlit/dashboard_data.py\n@@ -25,6 +25,7 @@ import pandas as pd\n \n import core\n from core import run_store as rs\n+from core import virtual_runs as vr\n from core import walk_forward as wf\n \n @dataclass(frozen=True)\n@@ -119,6 +120,50 @@ def _unique_labels(runs: pd.DataFrame) -> pd.Series:\n     return labels\n \n \n+def list_virtual_runs(store_root: str) -> pd.DataFrame:\n+    \"\"\"\n+    One row per portfolio run kept under <walk_forward>/VirtualRuns/ (run_store.save_virtual_run / save_baseline_runs), with the columns of\n+    list_mlflow_runs, built from the definitions in the ledgers (no run is loaded): label '<model> | <portfolio> | train N f M', 'portfolio' = the\n+    portfolio's name, 'kind' = reweighted | trained, and one tag_<key> column per tag of the portfolios (a filter for the group, the generator, ...).\n+    They are not in MLflow (no metrics).\n+    \"\"\"\n+    root, rows = Path(store_root), []\n+    for walk_forward_id in vr.walk_forward_ids_with_virtual_runs(root):\n+        for definition in vr.list_definitions(root, walk_forward_id):\n+            config, portfolio = definition[\"config\"], definition[\"config\"][\"portfolio\"]\n+            rows.append({\n+                \"display_name\": config[\"display_name\"], \"name\": config[\"name\"], \"store_run_id\": config[\"run_id\"],\n+                \"walk_forward_id\": walk_forward_id, \"store_path\": str(vr.virtual_runs_dir(root, walk_forward_id)), \"mlflow_run_id\": None,\n+                **config[\"params\"], \"portfolio\": portfolio[\"name\"], \"kind\": definition[\"kind\"].replace(\"trained_baseline\", \"trained\"),\n+                **{f\"tag_{key}\": value for key, value in portfolio.get(\"tags\", {}).items()},\n+            })\n+    return pd.DataFrame(rows)\n+\n+\n+def virtual_runs_stamp(store_root: str) -> tuple:\n+    \"\"\"The ledgers and the portfolio registry with their modification times: a cache key that changes when a portfolio run is saved.\"\"\"\n+    root = Path(store_root)\n+    files = [root / \"WalkForwardSetting\" / w / \"VirtualRuns\" / \"_ledger.jsonl\" for w in vr.walk_forward_ids_with_virtual_runs(root)]\n+    files += [root / \"Portfolios\" / \"portfolios.jsonl\"]\n+    return tuple((str(p), p.stat().st_mtime_ns) for p in files if p.exists())\n+\n+\n+def list_runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:\n+    \"\"\"What the pages list: the runs of MLflow and the portfolio runs of the store (list_virtual_runs), one table, one unique label each.\"\"\"\n+    logged, saved = list_mlflow_runs(tracking_uri, experiment), list_virtual_runs(store_root)\n+    if saved.empty:\n+        return logged\n+    out = pd.concat([logged, saved], ignore_index=True)\n+    out[\"kind\"] = out[\"kind\"].fillna(\"trained\")\n+    out[\"display_name\"] = _unique_labels(out)\n+    return out.sort_values([\"train_bars\", \"name\"]).reset_index(drop=True)\n+\n+\n+def is_virtual_run_id(store_run_id: str) -> bool:\n+    \"\"\"A run kept under VirtualRuns/ has '@<portfolio_id>' at the end of its id.\"\"\"\n+    return \"@\" in store_run_id\n+\n+\n def parameter_columns(runs: pd.DataFrame) -> list[str]:\n     \"\"\"The logged params that vary between the runs (what is worth grouping or comparing by).\"\"\"\n     base = {\"display_name\", \"name\", \"store_run_id\", \"walk_forward_id\", \"store_path\", \"mlflow_run_id\"}\n@@ -130,7 +175,10 @@ def parameter_columns(runs: pd.DataFrame) -> list[str]:\n # the run store (the data)\n # --------------------------------------------------------------------------------------------------\n \n-def load_run(store_run_id: str, store_root: str) -> wf.LoadedRun:\n+def load_run(store_run_id: str, store_root: str) -> wf.Run:\n+    \"\"\"A saved run (LoadedRun), or a portfolio run kept under VirtualRuns/ (id with '@<portfolio_id>'): StoredVirtualRun | StoredBaselineRun.\"\"\"\n+    if is_virtual_run_id(store_run_id):\n+        return rs.load_virtual_run(store_run_id, Path(store_root))\n     return rs.load_walk_forward_run(store_run_id, Path(store_root))\n \n \n@@ -336,14 +384,27 @@ def variance_baselines(\n     return frame.loc[frame.index.intersection(dates)]\n \n \n-def feature_importance(run: wf.LoadedRun) -> pd.DataFrame | None:\n-    path = run.run_dir / \"models\" / \"feature_importance.parquet\"\n-    return pd.read_parquet(path) if path.exists() else None\n+def _models_folder(run: wf.Run) -> Path | None:\n+    \"\"\"\n+    The folder of the saved models of a run: its own, or, for a portfolio run read off another run's per-ticker forecasts (the models do not depend on the\n+    weights), the base run's. None when no models are kept (a baseline kept under VirtualRuns/ is its residuals only, a training that is not saved has none).\n+    \"\"\"\n+    if isinstance(run, wf.ReweightedVirtualRun):\n+        return _models_folder(run.base)\n+    run_dir = getattr(run, \"run_dir\", None)\n+    return None if run_dir is None else run_dir / \"models\"\n+\n+\n+def feature_importance(run: wf.Run) -> pd.DataFrame | None:\n+    folder = _models_folder(run)\n+    path = None if folder is None else folder / \"feature_importance.parquet\"\n+    return pd.read_parquet(path) if path is not None and path.exists() else None\n \n \n-def garch_params(run: wf.LoadedRun) -> pd.DataFrame | None:\n-    path = run.run_dir / \"models\" / \"garch_params.json\"\n-    if not path.exists():\n+def garch_params(run: wf.Run) -> pd.DataFrame | None:\n+    folder = _models_folder(run)\n+    path = None if folder is None else folder / \"garch_params.json\"\n+    if path is None or not path.exists():\n         return None\n     params = rs._read_json(path)\n     first = next(iter(params.values()))\ndiff --git a/streamlit/page_experiments.py b/streamlit/page_experiments.py\nindex 696557a..7c0ff3d 100644\n--- a/streamlit/page_experiments.py\n+++ b/streamlit/page_experiments.py\n@@ -39,7 +39,7 @@ def render(settings: dd.Settings, sidebar_top) -> None:\n     # the experiment's own reading is used, not the one in the left panel: the result must not change with the sidebar\n     settings = dataclasses.replace(settings, reading=reading)\n \n-    runs = cmp._runs(settings.tracking_uri, settings.experiment)\n+    runs = cmp._runs(settings.tracking_uri, settings.experiment, settings.store_root)\n     by_id = runs.set_index(\"store_run_id\", drop=False) if not runs.empty else runs\n     missing = [i for i in experiment.run_ids if i not in by_id.index]\n     if missing:\ndiff --git a/streamlit/page_run_comparison.py b/streamlit/page_run_comparison.py\nindex 39826d7..7376dbe 100644\n--- a/streamlit/page_run_comparison.py\n+++ b/streamlit/page_run_comparison.py\n@@ -18,9 +18,14 @@ FILTER_COLUMNS = [\"portfolio\", \"train_bars\", \"model_family\", \"model_format\", \"ta\n \n # ---- cached loading ----------------------------------------------------------------------------------\n \n-@st.cache_data(show_spinner=\"Listing the runs from MLflow ...\")\n-def _runs(tracking_uri: str, experiment: str) -> pd.DataFrame:\n-    return dd.list_mlflow_runs(tracking_uri, experiment)\n+@st.cache_data(show_spinner=\"Listing the runs ...\")\n+def _runs_cached(tracking_uri: str, experiment: str, store_root: str, stamp: tuple) -> pd.DataFrame:\n+    return dd.list_runs(tracking_uri, experiment, store_root)\n+\n+\n+def _runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:\n+    \"\"\"The runs of MLflow and the portfolio runs kept in the store; the stamp makes the cache notice a portfolio run that was saved since.\"\"\"\n+    return _runs_cached(tracking_uri, experiment, store_root, dd.virtual_runs_stamp(store_root))\n \n \n @st.cache_resource(show_spinner=False)\n@@ -60,9 +65,9 @@ def _slice(frame: pd.DataFrame, start, end) -> pd.DataFrame:\n def render(settings: dd.Settings, sidebar_top) -> None:\n     \"\"\"sidebar_top: the container at the top of the left column (dashboard.py), where this page puts its run selection and period.\"\"\"\n     st.title(\"Run comparison\")\n-    runs = _runs(settings.tracking_uri, settings.experiment)\n+    runs = _runs(settings.tracking_uri, settings.experiment, settings.store_root)\n     if runs.empty:\n-        st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).\")\n+        st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}) or among the saved portfolios of {settings.store_root}.\")\n         return\n     reading, store_root = settings.reading, settings.store_root\n \ndiff --git a/streamlit/page_single_run.py b/streamlit/page_single_run.py\nindex f67690d..4e7ecea 100644\n--- a/streamlit/page_single_run.py\n+++ b/streamlit/page_single_run.py\n@@ -15,9 +15,14 @@ from tools.graph_helpers import plot_exceedance_days_focus, plot_var_models_vs_l\n READING_COLORS = [None, \"red\", \"blue\", \"green\", \"violet\", \"orange\"]   # None = the sidebar reading (default text color)\n \n \n-@st.cache_data(show_spinner=\"Listing the runs from MLflow ...\")\n-def _runs(tracking_uri: str, experiment: str) -> pd.DataFrame:\n-    return dd.list_mlflow_runs(tracking_uri, experiment)\n+@st.cache_data(show_spinner=\"Listing the runs ...\")\n+def _runs_cached(tracking_uri: str, experiment: str, store_root: str, stamp: tuple) -> pd.DataFrame:\n+    return dd.list_runs(tracking_uri, experiment, store_root)\n+\n+\n+def _runs(tracking_uri: str, experiment: str, store_root: str) -> pd.DataFrame:\n+    \"\"\"The runs of MLflow and the portfolio runs kept in the store; the stamp makes the cache notice a portfolio run that was saved since.\"\"\"\n+    return _runs_cached(tracking_uri, experiment, store_root, dd.virtual_runs_stamp(store_root))\n \n \n @st.cache_resource(show_spinner=False)\n@@ -43,9 +48,9 @@ def _ticker_frames(store_run_id: str, store_root: str) -> dict:\n def render(settings: dd.Settings, sidebar_top) -> None:\n     \"\"\"sidebar_top: the container at the top of the left column (dashboard.py), where this page puts its run controls.\"\"\"\n     st.title(\"Single run\")\n-    runs = _runs(settings.tracking_uri, settings.experiment)\n+    runs = _runs(settings.tracking_uri, settings.experiment, settings.store_root)\n     if runs.empty:\n-        st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).\")\n+        st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}) or among the saved portfolios of {settings.store_root}.\")\n         return\n \n     # the left column, on top: which run, what it is, and the period everything on the page is analysed on\ndiff --git a/streamlit/page_weight_adjustment.py b/streamlit/page_weight_adjustment.py\nindex 9845844..1f4087a 100644\n--- a/streamlit/page_weight_adjustment.py\n+++ b/streamlit/page_weight_adjustment.py\n@@ -90,7 +90,8 @@ def _weights_editor(run_id: str, default: pd.Series) -> pd.Series:\n \n def render(settings: dd.Settings, sidebar_top) -> None:\n     st.title(\"Portfolio ticker weight adjustment\")\n-    runs = cmp._runs(settings.tracking_uri, settings.experiment)\n+    runs = cmp._runs(settings.tracking_uri, settings.experiment, settings.store_root)\n+    runs = runs[~runs[\"store_run_id\"].map(dd.is_virtual_run_id)] if not runs.empty else runs      # a portfolio run is already read for its weights: only runs of the walk-forwards are re-weighted\n     if runs.empty:\n         st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).\")\n         return\ndiff --git a/streamlit/page_weight_comparison.py b/streamlit/page_weight_comparison.py\nindex 7a4e5d2..8f8bb55 100644\n--- a/streamlit/page_weight_comparison.py\n+++ b/streamlit/page_weight_comparison.py\n@@ -59,7 +59,8 @@ def _ticker_sets(store_run_ids: tuple, store_root: str) -> dict:\n \n def render(settings: dd.Settings, sidebar_top) -> None:\n     st.title(\"Model comparison with user defined weights\")\n-    runs = cmp._runs(settings.tracking_uri, settings.experiment)\n+    runs = cmp._runs(settings.tracking_uri, settings.experiment, settings.store_root)\n+    runs = runs[~runs[\"store_run_id\"].map(dd.is_virtual_run_id)] if not runs.empty else runs      # a portfolio run is already read for its weights: only runs of the walk-forwards are re-weighted\n     if runs.empty:\n         st.warning(f\"No runs found in MLflow experiment '{settings.experiment}' ({settings.tracking_uri}).\")\n         return\ndiff --git a/training/train_23_experiment.py b/training/train_23_experiment.py\nindex 5d6dea5..3a37ff1 100644\n--- a/training/train_23_experiment.py\n+++ b/training/train_23_experiment.py\n@@ -11,7 +11,6 @@ can be applied to a calendar with another portfolio (ModelRecipe.pretrained_from\n \n     S23  the 23 tickers, equal weight 1/23: the models are TRAINED here (pooled over 23 tickers); slim runs (no per-window feature files)\n     S4   AAPL, JPM, XOM, KO, 0.25 each: the S23 models APPLIED (names ..._from23) and, as the reference, the same models TRAINED on the 4 tickers\n-    S13  the 13 tickers of the first batch, 1/13 each: the S23 models applied (slim)\n \n The runs are saved in the run store (a saved run is reused: the script can be run again after an interruption) and logged to MLflow.\n \"\"\"\n@@ -42,8 +41,10 @@ MLFLOW_EXPERIMENT = 'walk_forward_horizon'\n READING = wf.Reading(var_confidence=0.95, window_size=252, min_periods=30, test_confidence=0.95)\n \n TICKERS_4 = ['AAPL', 'JPM', 'XOM', 'KO']\n-TICKERS_13 = [\"AAPL\", \"MSFT\", \"NVDA\", \"AVGO\", \"GOOGL\", \"META\", \"NFLX\", \"AMZN\", \"HD\", \"MCD\", \"PG\", \"KO\", \"WMT\"]\n-TICKERS_23 = TICKERS_13 + [\"XOM\", \"CVX\", \"JPM\", \"GS\", \"BAC\", \"V\", \"JNJ\", \"UNH\", \"LLY\", \"MRK\"]\n+TICKERS_23 = [      # the order is part of the walk-forward id: do not reorder\n+    \"AAPL\", \"MSFT\", \"NVDA\", \"AVGO\", \"GOOGL\", \"META\", \"NFLX\", \"AMZN\", \"HD\", \"MCD\", \"PG\", \"KO\", \"WMT\",\n+    \"XOM\", \"CVX\", \"JPM\", \"GS\", \"BAC\", \"V\", \"JNJ\", \"UNH\", \"LLY\", \"MRK\",\n+]\n \n prices = pd.read_csv(DATA_PATH, parse_dates=['Date'], index_col='Date')       # META is empty before 2012-05-18: the walk-forwards start in 2016\n \n@@ -88,8 +89,8 @@ def timed(label: str, function):\n \n \n def main() -> None:\n-    s23, s4, s13 = setting_of(TICKERS_23), setting_of(TICKERS_4), setting_of(TICKERS_13)\n-    for name, s in ((\"S23\", s23), (\"S4\", s4), (\"S13\", s13)):\n+    s23, s4 = setting_of(TICKERS_23), setting_of(TICKERS_4)\n+    for name, s in ((\"S23\", s23), (\"S4\", s4)):\n         table = s.window_table()\n         print(f\"{name}: {len(s.tickers)} tickers, {len(table)} windows, forecast {table['forecast_start'].iloc[0].date()} .. {table['forecast_end'].iloc[-1].date()} | {s.walk_forward_id[-40:]}\", flush=True)\n \n@@ -109,14 +110,7 @@ def main() -> None:\n         applied = dataclasses.replace(recipe, pretrained_from=trained[name].run_id)\n         timed(f\"S4  {name}_from23 (the 23-ticker model applied)\", lambda: rs.train_and_save_walk_forward_run(s4, applied, f\"{name}_from23\"))\n \n-    # 3. the 13 tickers: the baselines and the 23-ticker models applied\n-    for name, recipe in BASELINES.items():\n-        timed(f\"S13 {name}\", lambda: rs.train_and_save_walk_forward_run(s13, recipe, name, slim=True))\n-    for name, recipe in XGB_RECIPES.items():\n-        applied = dataclasses.replace(recipe, pretrained_from=trained[name].run_id)\n-        timed(f\"S13 {name}_from23 (the 23-ticker model applied)\", lambda: rs.train_and_save_walk_forward_run(s13, applied, f\"{name}_from23\", slim=True))\n-\n-    walk_forward_ids = {s23.walk_forward_id, s4.walk_forward_id, s13.walk_forward_id}\n+    walk_forward_ids = {s23.walk_forward_id, s4.walk_forward_id}\n     for run in [r for r in rs.load_runs(train_bars=756, forecast_bars=21) if r.walk_forward_id in walk_forward_ids]:\n         rs.log_walk_forward_run_to_mlflow(run, READING, experiment=MLFLOW_EXPERIMENT)\n     print(\"done\", flush=True)\n",
+    "dirty": true,
+    "git_commit": "84fe46a5b45a1977a1c210e14a48f0c85347f27f"
+  },
+  "created_at": "2026-11-03T19:27:55",
+  "data": {
+    "data_path": "./data_general/23_ticker_data_2010_2026.csv",
+    "sha256": "6f385e2e410c77e1944874b8ff99c7d91d3b474e3755b0fcc50b63ea570329f6"
+  },
+  "display_name": "xgb_F2_ratio | train 756 f 21",
+  "frequency": "1 days 00:00:00",
+  "keys": {
+    "feature_target_key": "516564e7",
+    "model_key": "89b51a1f",
+    "train_bars": 756,
+    "walk_forward_id": "from2016-03-01_to2026-06-30_train756bars_forecast21bars_23tickers_d93e1cd5"
+  },
+  "name": "xgb_F2_ratio",
+  "params": {
+    "default_mu_hat": 0.0,
+    "ewma_lam": 0.94,
+    "ewma_min_periods": 30,
+    "expanding": false,
+    "feature_blocks": "Returns+AbsReturn+RollingStats(windows=(5,10,21))+EwmaVol(span=21)+Vix(level=True,changes=(5,))+Sp500Return(bars=(1,5,21))+YieldSpread10y3m+YieldSpread10y5y+YieldSpread30y10y",
+    "feature_unit": "percent",
+    "forecast_bars": 21,
+    "model_family": "xgboost",
+    "model_format": "long",
+    "mu_mode": "constant",
+    "slim": true,
+    "target": "RatioToBase",
+    "target_base_lam": 0.94,
+    "target_clip": 20.0,
+    "target_min_periods": 30,
+    "target_scale": 1.0,
+    "target_unit": "percent",
+    "train_bars": 756,
+    "training_loss": "MSE",
+    "unit": "percent"
+  },
+  "recipe": {
+    "__class__": "walk_forward.ModelRecipe",
+    "default_mu_hat": 0.0,
+    "ewma_lam": 0.94,
+    "ewma_min_periods": 30,
+    "features": {
+      "__class__": "feature_blocks.FeatureSpec",
+      "blocks": {
+        "__tuple__": [
+          {
+            "__class__": "feature_blocks.Returns"
+          },
+          {
+            "__class__": "feature_blocks.AbsReturn"
+          },
+          {
+            "__class__": "feature_blocks.RollingStats",
+            "windows": {
+              "__tuple__": [
+                5,
+                10,
+                21
+              ]
+            }
+          },
+          {
+            "__class__": "feature_blocks.EwmaVol",
+            "span": 21
+          },
+          {
+            "__class__": "feature_blocks.Vix",
+            "changes": {
+              "__tuple__": [
+                5
+              ]
+            },
+            "level": true
+          },
+          {
+            "__class__": "feature_blocks.Sp500Return",
+            "bars": {
+              "__tuple__": [
+                1,
+                5,
+                21
+              ]
+            }
+          },
+          {
+            "__class__": "feature_blocks.YieldSpread10y3m"
+          },
+          {
+            "__class__": "feature_blocks.YieldSpread10y5y"
+          },
+          {
+            "__class__": "feature_blocks.YieldSpread30y10y"
+          }
+        ]
+      },
+      "unit": "percent"
+    },
+    "model_family": "xgboost",
+    "model_format": "long",
+    "model_kwargs": {},
+    "mu_mode": "constant",
+    "pretrained_from": null,
+    "rolling_mu_hat_window_size": null,
+    "target": {
+      "__class__": "targets.RatioToBase",
+      "base_lam": 0.94,
+      "clip": 20.0,
+      "min_periods": 30,
+      "scale": 1.0,
+      "unit": "percent"
+    }
+  },
+  "run_id": "from2016-03-01_to2026-06-30_train756bars_forecast21bars_23tickers_d93e1cd5/516564e7/xgboost-long-89b51a1f",
+  "setting": {
+    "additional_feature_sources": [
+      {
+        "available_after_bars": 0,
+        "column": null,
+        "path": "data_general/RV_sip_23tickers.csv",
+        "scope": "tickers",
+        "tag": "rv"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/vix.csv",
+        "scope": "market",
+        "tag": "vix"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/sp500.csv",
+        "scope": "market",
+        "tag": "sp500"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us3m.csv",
+        "scope": "market",
+        "tag": "us3m"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us5y.csv",
+        "scope": "market",
+        "tag": "us5y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us10y.csv",
+        "scope": "market",
+        "tag": "us10y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us30y.csv",
+        "scope": "market",
+        "tag": "us30y"
+      }
+    ],
+    "drop_market_closed": true,
+    "end_date": "2026-06-30",
+    "expanding": false,
+    "forecast_bars": 21,
+    "start_date": "2016-03-01",
+    "tickers": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "AVGO",
+      "GOOGL",
+      "META",
+      "NFLX",
+      "AMZN",
+      "HD",
+      "MCD",
+      "PG",
+      "KO",
+      "WMT",
+      "XOM",
+      "CVX",
+      "JPM",
+      "GS",
+      "BAC",
+      "V",
+      "JNJ",
+      "UNH",
+      "LLY",
+      "MRK"
+    ],
+    "train_bars": 756,
+    "unit": "percent",
+    "warmup_bars": 30,
+    "weights": {
+      "AAPL": 0.04347826086956522,
+      "AMZN": 0.04347826086956522,
+      "AVGO": 0.04347826086956522,
+      "BAC": 0.04347826086956522,
+      "CVX": 0.04347826086956522,
+      "GOOGL": 0.04347826086956522,
+      "GS": 0.04347826086956522,
+      "HD": 0.04347826086956522,
+      "JNJ": 0.04347826086956522,
+      "JPM": 0.04347826086956522,
+      "KO": 0.04347826086956522,
+      "LLY": 0.04347826086956522,
+      "MCD": 0.04347826086956522,
+      "META": 0.04347826086956522,
+      "MRK": 0.04347826086956522,
+      "MSFT": 0.04347826086956522,
+      "NFLX": 0.04347826086956522,
+      "NVDA": 0.04347826086956522,
+      "PG": 0.04347826086956522,
+      "UNH": 0.04347826086956522,
+      "V": 0.04347826086956522,
+      "WMT": 0.04347826086956522,
+      "XOM": 0.04347826086956522
+    }
+  },
+  "versions": {
+    "arch": "8.0.0",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "xgboost": "3.4.1"
+  },
+  "walk_forward_id": "from2016-03-01_to2026-06-30_train756bars_forecast21bars_23tickers_d93e1cd5"
+}
