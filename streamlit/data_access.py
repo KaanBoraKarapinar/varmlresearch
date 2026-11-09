@@ -1,8 +1,9 @@
 """
 Where the data of the pages comes from, and who may see it.
 
-On the machine that has the run store (store/ and mlruns.db), nothing here does anything. On a machine that has not (the deployed dashboard) the store is
-kept in a bucket (core/remote_store.py): the setting STORE_REMOTE names it. Until a visitor gives the password (the setting DASHBOARD_PASSWORD) the Results and
+STORE_IN_BUCKET below is the switch. False (the machine that has the run store, store/ and mlruns.db): nothing here does anything. True (the deployed dashboard): the
+store is kept in the project's bucket (core/remote_store.py, PROJECT_REMOTE) and the password is asked, with no setting that switches it on. Until a visitor gives
+the password (the setting DASHBOARD_PASSWORD) the Results and
 Experiments pages show the results cache that is in the repository (core/results_cache.py, results_cache/): the saved experiments at their reading, no bucket. The
 password is asked where more than that is wanted: the other pages, another VaR reading, the per ticker variances. The password only saves the bucket's bandwidth,
 it does not hide anything. After it the store is fetched once for the whole process (files that are there are not fetched again) and the page opens. The big
@@ -12,9 +13,9 @@ by one when a page first reads them (core.remote_store.OnDemand).
 The settings are read from the environment, from the .env file of the project root (not tracked) and from st.secrets (.streamlit/secrets.toml, or the secrets of
 the deployment), in this order:
 
-    STORE_REMOTE            "s3://<bucket>/<prefix>" or a folder; not set: the store is local and the pages open without a password
-    DASHBOARD_PASSWORD      required when STORE_REMOTE is set (the dashboard does not open its data without one)
-    S3_ENDPOINT_URL, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION     the bucket's, when STORE_REMOTE is s3://  (read only is enough)
+    DASHBOARD_PASSWORD      required when STORE_IN_BUCKET is True (the dashboard does not open its data without one)
+    S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY      the project bucket's keys (a read only key is enough); its endpoint and region are in core/remote_store.py
+    STORE_REMOTE            optional: another bucket ("s3://<bucket>/<prefix>") or a folder than the project's, for a test
 
 The Approach page needs no data and is open. The password is never written in the code or the repository.
 """
@@ -35,8 +36,10 @@ from core import remote_store as rso
 from core import virtual_runs as vr
 from core import walk_forward as wf
 
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-REMOTE_SETTING = "STORE_REMOTE"
+ROOT = Path(__file__).resolve().parent.parent
+ENV_FILE = ROOT / ".env"
+STORE_IN_BUCKET = True                  # True: the store is in the project's bucket and the data pages ask for the password (the deployed dashboard). False: it is on this disk
+REMOTE_SETTING = "STORE_REMOTE"         # optional: another bucket or a folder than rso.PROJECT_REMOTE (a test); not needed
 PASSWORD_SETTING = "DASHBOARD_PASSWORD"
 UNLOCKED_KEY = "data_unlocked"          # session state: this visitor gave the password
 WRONG_PASSWORD_DELAY = 1.0              # seconds a wrong password costs
@@ -68,12 +71,13 @@ def setting(name: str) -> str | None:
 
 
 def _all_settings() -> dict[str, str | None]:
-    return {name: setting(name) for name in rso.S3_SETTINGS}
+    """What open_store needs: the project bucket's endpoint and region (written in core/remote_store.py) and its keys (a setting)."""
+    return rso.project_settings({name: setting(name) for name in rso.PROJECT_KEYS})
 
 
 def remote() -> str | None:
-    """The bucket the store is fetched from, None when the store is local."""
-    return setting(REMOTE_SETTING)
+    """The bucket the store is fetched from; None when STORE_IN_BUCKET is False (the store is on this disk and nothing is asked)."""
+    return (setting(REMOTE_SETTING) or rso.PROJECT_REMOTE) if STORE_IN_BUCKET else None
 
 
 def password_is_right(entered: str, expected: str) -> bool:
@@ -159,7 +163,7 @@ def _run_fetch(root: Path, bucket: str, settings: dict[str, str | None], numbers
 
 def require_data(root: Path) -> None:
     """
-    Call it first in every page that reads the run store. Local store (no STORE_REMOTE): nothing. Otherwise: the password form until the visitor has given the
+    Call it first in every page that reads the run store. STORE_IN_BUCKET False: nothing. Otherwise: the password form until the visitor has given the
     password, then the store is fetched once; the page goes on when this returns (st.stop() ends the script here while the form is shown).
     """
     bucket = remote()

@@ -31,6 +31,12 @@ MANIFEST_KEY = "manifest.json"
 KEPT = ("store", "mlruns.db")               # what the bucket holds, relative to the project root
 IGNORED_NAMES = {".DS_Store"}
 S3_SETTINGS = ("S3_ENDPOINT_URL", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION")    # what an s3:// remote needs besides its name
+
+# the bucket of this project: not secrets (the keys are), so they are written here and not in an environment. The deployed dashboard and upload_store.py use them.
+PROJECT_REMOTE = "s3://varprojectbucket/MLProject-standalone"
+PROJECT_ENDPOINT = "https://s3.us-east-005.backblazeb2.com"
+PROJECT_REGION = "us-east-005"
+PROJECT_KEYS = ("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")       # the secrets of the bucket: read only for the dashboard, read and write for upload_store.py
 HASH_CHUNK = 1 << 20
 
 
@@ -95,6 +101,11 @@ class S3Store:
 
     def write_text(self, key: str, text: str) -> None:
         self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=text.encode("utf-8"), ContentType="application/json")
+
+
+def project_settings(secrets: Mapping[str, str | None]) -> dict[str, str | None]:
+    """The S3_SETTINGS of this project's bucket: its endpoint and region from above, its keys from secrets (None where they are not given)."""
+    return {"S3_ENDPOINT_URL": PROJECT_ENDPOINT, "S3_REGION": PROJECT_REGION, **{name: secrets.get(name) for name in PROJECT_KEYS}}
 
 
 def open_store(remote: str, settings: Mapping[str, str | None]) -> ObjectStore:
