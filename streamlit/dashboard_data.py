@@ -442,7 +442,7 @@ def baseline_runs(run: wf.Run, weights: dict[str, float], store_root: str) -> di
     """
     stored = rs._read_json(rs.walk_forward_dir(run.walk_forward_id, Path(store_root)) / "WalkForwardSettings.json")
     prices = pd.read_csv(ROOT / stored["data"]["data_path"], parse_dates=["Date"], index_col="Date")
-    setting = rs.load_walk_forward(run.walk_forward_id, prices, Path(store_root))
+    setting = rs.load_walk_forward(run.walk_forward_id, prices, Path(store_root), check_data_values=False)     # the dashboard may run on another processor than the training
     setting = dataclasses.replace(setting, weights=dict(weights))
     out = {}
     with contextlib.redirect_stdout(io.StringIO()):         # the calendars print a warning for every market holiday they skip
