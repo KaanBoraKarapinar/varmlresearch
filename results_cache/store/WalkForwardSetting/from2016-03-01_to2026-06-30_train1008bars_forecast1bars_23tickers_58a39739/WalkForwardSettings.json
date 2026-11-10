@@ -1,0 +1,120 @@
+{
+  "data": {
+    "data_path": "./data_general/23_ticker_data_2010_2026.csv",
+    "first_date": "2010-01-04",
+    "last_date": "2026-06-30",
+    "sha256": "6f385e2e410c77e1944874b8ff99c7d91d3b474e3755b0fcc50b63ea570329f6"
+  },
+  "setting": {
+    "additional_feature_sources": [
+      {
+        "available_after_bars": 0,
+        "column": null,
+        "path": "data_general/RV_sip_23tickers.csv",
+        "scope": "tickers",
+        "tag": "rv"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/vix.csv",
+        "scope": "market",
+        "tag": "vix"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/sp500.csv",
+        "scope": "market",
+        "tag": "sp500"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us3m.csv",
+        "scope": "market",
+        "tag": "us3m"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us5y.csv",
+        "scope": "market",
+        "tag": "us5y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us10y.csv",
+        "scope": "market",
+        "tag": "us10y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us30y.csv",
+        "scope": "market",
+        "tag": "us30y"
+      }
+    ],
+    "drop_market_closed": true,
+    "end_date": "2026-06-30",
+    "expanding": false,
+    "forecast_bars": 1,
+    "start_date": "2016-03-01",
+    "tickers": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "AVGO",
+      "GOOGL",
+      "META",
+      "NFLX",
+      "AMZN",
+      "HD",
+      "MCD",
+      "PG",
+      "KO",
+      "WMT",
+      "XOM",
+      "CVX",
+      "JPM",
+      "GS",
+      "BAC",
+      "V",
+      "JNJ",
+      "UNH",
+      "LLY",
+      "MRK"
+    ],
+    "train_bars": 1008,
+    "unit": "percent",
+    "warmup_bars": 30,
+    "weights": {
+      "AAPL": 0.04347826086956522,
+      "AMZN": 0.04347826086956522,
+      "AVGO": 0.04347826086956522,
+      "BAC": 0.04347826086956522,
+      "CVX": 0.04347826086956522,
+      "GOOGL": 0.04347826086956522,
+      "GS": 0.04347826086956522,
+      "HD": 0.04347826086956522,
+      "JNJ": 0.04347826086956522,
+      "JPM": 0.04347826086956522,
+      "KO": 0.04347826086956522,
+      "LLY": 0.04347826086956522,
+      "MCD": 0.04347826086956522,
+      "META": 0.04347826086956522,
+      "MRK": 0.04347826086956522,
+      "MSFT": 0.04347826086956522,
+      "NFLX": 0.04347826086956522,
+      "NVDA": 0.04347826086956522,
+      "PG": 0.04347826086956522,
+      "UNH": 0.04347826086956522,
+      "V": 0.04347826086956522,
+      "WMT": 0.04347826086956522,
+      "XOM": 0.04347826086956522
+    }
+  },
+  "walk_forward_id": "from2016-03-01_to2026-06-30_train1008bars_forecast1bars_23tickers_58a39739"
+}

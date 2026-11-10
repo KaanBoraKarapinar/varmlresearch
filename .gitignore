@@ -3,8 +3,13 @@ mlruns.db
 mlartifacts/
 data_raw/
 
+# ... except the results cache of the dashboard (core/results_cache.py): a small part of the store and its index, kept in the repository
+!results_cache/store/
+!results_cache/mlruns.db
+
 # secrets and local settings
 .env
+.streamlit/secrets.toml
 .idea/
 .venv/
 .DS_Store
@@ -29,3 +34,4 @@ learn/
 notebooks/
 approach.pdf
 results.pdf
+loaddata.py

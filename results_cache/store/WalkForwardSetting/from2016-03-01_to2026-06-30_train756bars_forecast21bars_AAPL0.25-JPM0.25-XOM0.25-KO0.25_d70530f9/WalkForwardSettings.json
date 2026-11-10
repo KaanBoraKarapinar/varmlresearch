@@ -1,0 +1,82 @@
+{
+  "data": {
+    "data_path": "./data_general/23_ticker_data_2010_2026.csv",
+    "first_date": "2010-01-04",
+    "last_date": "2026-06-30",
+    "sha256": "b24343eb7ff98fef0cffd782db1f127f76bd20b507ffca3582221f1205264d75"
+  },
+  "setting": {
+    "additional_feature_sources": [
+      {
+        "available_after_bars": 0,
+        "column": null,
+        "path": "data_general/RV_sip_23tickers.csv",
+        "scope": "tickers",
+        "tag": "rv"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/vix.csv",
+        "scope": "market",
+        "tag": "vix"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/sp500.csv",
+        "scope": "market",
+        "tag": "sp500"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us3m.csv",
+        "scope": "market",
+        "tag": "us3m"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us5y.csv",
+        "scope": "market",
+        "tag": "us5y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us10y.csv",
+        "scope": "market",
+        "tag": "us10y"
+      },
+      {
+        "available_after_bars": 0,
+        "column": "Close",
+        "path": "data_general/us30y.csv",
+        "scope": "market",
+        "tag": "us30y"
+      }
+    ],
+    "drop_market_closed": true,
+    "end_date": "2026-06-30",
+    "expanding": false,
+    "forecast_bars": 21,
+    "start_date": "2016-03-01",
+    "tickers": [
+      "AAPL",
+      "JPM",
+      "XOM",
+      "KO"
+    ],
+    "train_bars": 756,
+    "unit": "percent",
+    "warmup_bars": 30,
+    "weights": {
+      "AAPL": 0.25,
+      "JPM": 0.25,
+      "KO": 0.25,
+      "XOM": 0.25
+    }
+  },
+  "walk_forward_id": "from2016-03-01_to2026-06-30_train756bars_forecast21bars_AAPL0.25-JPM0.25-XOM0.25-KO0.25_d70530f9"
+}

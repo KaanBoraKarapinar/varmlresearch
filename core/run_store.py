@@ -228,12 +228,21 @@ def save_walk_forward(setting: wf.WalkForwardSetting, root: Path = STORE_ROOT) -
     return folder
 
 
-def load_walk_forward(walk_forward_id: str, tickers_raw_price_data: pd.DataFrame, root: Path = STORE_ROOT) -> wf.WalkForwardSetting:
-    """Rebuild the setting from WalkForwardSettings.json + the price data, checking the hash, the windows and the data."""
+def load_walk_forward(
+    walk_forward_id: str, tickers_raw_price_data: pd.DataFrame, root: Path = STORE_ROOT, *, check_data_values: bool = True,
+) -> wf.WalkForwardSetting:
+    """
+    Rebuild the setting from WalkForwardSettings.json + the price data, checking the hash, the windows and the data.
+
+    check_data_values=False: the last part of the id (the hash8, which includes a hash of the parsed VALUES of the price and the additional feature CSVs) may differ.
+    The same CSV parses to other last bits on another processor (pandas' default float parser works in the platform's long double, which is 64 bit on an arm64 Mac
+    and 80 bit on x86 Linux), so a store trained on one machine does not reproduce its hash on the other. Everything the id spells out (dates, bar counts, tickers
+    and weights) and the saved windows must still match. For a machine that only reads a store (the deployed dashboard); training keeps the strict check.
+    """
     folder = walk_forward_dir(walk_forward_id, root)
     stored = _read_json(folder / "WalkForwardSettings.json")
     setting = _setting_from_config(stored["setting"], tickers_raw_price_data, stored["data"]["data_path"])
-    if setting.walk_forward_id != walk_forward_id:
+    if setting.walk_forward_id != walk_forward_id and (check_data_values or setting.walk_forward_id.rpartition("_")[0] != walk_forward_id.rpartition("_")[0]):
         raise ValueError(
             f"The price data does not reproduce {walk_forward_id} (got {setting.walk_forward_id}): other data or other inputs."
         )
@@ -266,7 +275,7 @@ def _write_raw_residual_banks(folder: Path, fits: list[wf.WalkForwardSingleCalen
 def _write_ewma(run_dir: Path, fits: list[wf.WalkForwardSingleCalendarFit], metadata: dict, keep_raw: bool = True) -> None:
     if fits[0].ewma_bank is None:
         return
-    _to_parquet(wf.build_combined_ewma_bank_WITHOUT_CALC(fits), run_dir / "WALK_FORWARD_EWMA_BANK.parquet", metadata)
+    _to_parquet(wf.build_combined_ewma_bank_WITHOUT_CALC(fits), run_dir / wf.EWMA_BANK_FILE, metadata)
     _to_parquet(wf.build_first_window_training_bank(fits), run_dir / wf.FIRST_WINDOW_TRAINING_BANK_FILE, metadata)
     if not keep_raw:
         return

@@ -1,0 +1,71 @@
+{
+  "features": {
+    "__class__": "feature_blocks.FeatureSpec",
+    "blocks": {
+      "__tuple__": [
+        {
+          "__class__": "feature_blocks.Returns"
+        },
+        {
+          "__class__": "feature_blocks.AbsReturn"
+        },
+        {
+          "__class__": "feature_blocks.RollingStats",
+          "windows": {
+            "__tuple__": [
+              5,
+              10,
+              21
+            ]
+          }
+        },
+        {
+          "__class__": "feature_blocks.EwmaVol",
+          "span": 21
+        },
+        {
+          "__class__": "feature_blocks.RvHar",
+          "month": 22,
+          "week": 5
+        },
+        {
+          "__class__": "feature_blocks.Vix",
+          "changes": {
+            "__tuple__": [
+              5
+            ]
+          },
+          "level": true
+        },
+        {
+          "__class__": "feature_blocks.Sp500Return",
+          "bars": {
+            "__tuple__": [
+              1,
+              5,
+              21
+            ]
+          }
+        },
+        {
+          "__class__": "feature_blocks.YieldSpread10y3m"
+        },
+        {
+          "__class__": "feature_blocks.YieldSpread10y5y"
+        },
+        {
+          "__class__": "feature_blocks.YieldSpread30y10y"
+        }
+      ]
+    },
+    "unit": "percent"
+  },
+  "target": {
+    "__class__": "targets.RatioToBase",
+    "base_lam": 0.94,
+    "clip": 20.0,
+    "min_periods": 30,
+    "scale": 1.0,
+    "unit": "percent"
+  }
+}

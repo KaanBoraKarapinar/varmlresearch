@@ -1,0 +1,40 @@
+{
+  "features": {
+    "__class__": "feature_blocks.FeatureSpec",
+    "blocks": {
+      "__tuple__": [
+        {
+          "__class__": "feature_blocks.Returns"
+        },
+        {
+          "__class__": "feature_blocks.AbsReturn"
+        },
+        {
+          "__class__": "feature_blocks.RollingStats",
+          "windows": {
+            "__tuple__": [
+              5,
+              10,
+              21
+            ]
+          }
+        },
+        {
+          "__class__": "feature_blocks.EwmaVol",
+          "span": 21
+        },
+        {
+          "__class__": "feature_blocks.RvHar",
+          "month": 22,
+          "week": 5
+        }
+      ]
+    },
+    "unit": "percent"
+  },
+  "target": {
+    "__class__": "targets.RelativeRvChange",
+    "scale": 1.0,
+    "unit": "percent"
+  }
+}

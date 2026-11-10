@@ -1,0 +1,31 @@
+{
+  "recipe": {
+    "__class__": "walk_forward.ModelRecipe",
+    "default_mu_hat": 0.0,
+    "ewma_lam": 0.94,
+    "ewma_min_periods": 30,
+    "features": null,
+    "model_family": "garch",
+    "model_format": "wide",
+    "model_kwargs": {
+      "dist": "normal",
+      "mean": "Zero",
+      "p": 1,
+      "q": 1,
+      "vol": "GARCH"
+    },
+    "mu_mode": "constant",
+    "pretrained_from": null,
+    "rolling_mu_hat_window_size": null,
+    "target": null
+  },
+  "recipe_key": "25f175f0",
+  "run_name": "garch_wide",
+  "versions": {
+    "arch": "8.0.0",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "xgboost": "3.4.1"
+  }
+}

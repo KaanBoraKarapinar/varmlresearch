@@ -1,0 +1,28 @@
+{
+  "features": {
+    "__class__": "feature_blocks.FeatureSpec",
+    "blocks": {
+      "__tuple__": [
+        {
+          "__class__": "feature_blocks.Returns"
+        },
+        {
+          "__class__": "feature_blocks.AbsReturn"
+        },
+        {
+          "__class__": "feature_blocks.EwmaVol",
+          "span": 21
+        }
+      ]
+    },
+    "unit": "percent"
+  },
+  "target": {
+    "__class__": "targets.RatioToBase",
+    "base_lam": 0.94,
+    "clip": 20.0,
+    "min_periods": 30,
+    "scale": 1.0,
+    "unit": "percent"
+  }
+}

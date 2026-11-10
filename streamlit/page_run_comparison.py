@@ -8,6 +8,7 @@ import streamlit as st
 import core
 import dashboard_data as dd
 import dashboard_figures as figs
+import data_access
 from core import realized_loss as rl
 from core import run_store as rs
 from core import walk_forward as wf
@@ -163,7 +164,10 @@ def analysis(
     with tabs[2]:
         _variance_tab(ewma_references, chosen, dailies, settings)
     with tabs[3]:
-        _ticker_tab(chosen, list(chosen), start, end)
+        if data_access.is_locked():     # the per ticker banks are in the bucket, not in the results cache
+            data_access.ask_password("unlock_ticker_tab", "The per ticker variances are read from the per ticker banks, which are kept in the private store. Give the password to load it.")
+        else:
+            _ticker_tab(chosen, list(chosen), start, end)
     with tabs[4]:
         _exceedances_tab(chosen, table, var_dfs, settings)
 

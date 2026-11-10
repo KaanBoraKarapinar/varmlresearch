@@ -44,11 +44,14 @@ from core import (
     qlike,
     return_to_percent,
 )
-from core import feature_blocks, targets
+from core import feature_blocks, remote_store, targets
 from core.ResidualBank import RESIDUAL_COLS
 from core.virtual_runs import portfolio_id, read_residuals
 from core.feature_blocks import Returns
 from core.units import return_to_percent
+
+# the per-ticker variance forecasts, returns and EWMA covariances of every window (long / ewma family)
+EWMA_BANK_FILE = "WALK_FORWARD_EWMA_BANK.parquet"
 
 # the training days of the FIRST window only (per-ticker sigma / returns / EWMA covariance): the forecast days' quantile
 # reads these standardized residuals until it has a full window of out-of-sample ones, so re-weighting needs them
@@ -1203,24 +1206,27 @@ class LoadedRun(Run):
     def raw_residual_bank(self, window_id: int) -> pd.DataFrame:
         return pd.read_parquet(self.run_dir / "raw_residual_banks" / f"{_calendar_name(window_id)}.parquet")
 
+    # the two banks are big: a deployed dashboard leaves them in the bucket until they are read (remote_store.OnDemand); on a local store this changes nothing
     @property
     def has_ewma_bank(self) -> bool:
-        return (self.run_dir / "WALK_FORWARD_EWMA_BANK.parquet").exists()
+        return remote_store.exists(self.run_dir / EWMA_BANK_FILE)
 
     @cached_property
     def ewma_bank(self) -> pd.DataFrame:
-        path = self.run_dir / "WALK_FORWARD_EWMA_BANK.parquet"
+        path = self.run_dir / EWMA_BANK_FILE
+        remote_store.ensure(path)
         if not path.exists():
             raise FileNotFoundError(f"{self.display_name} has no ewma bank (not a long / ewma run).")
         return pd.read_parquet(path)
 
     @property
     def has_first_window_training_bank(self) -> bool:
-        return (self.run_dir / FIRST_WINDOW_TRAINING_BANK_FILE).exists()
+        return remote_store.exists(self.run_dir / FIRST_WINDOW_TRAINING_BANK_FILE)
 
     @cached_property
     def first_window_training_bank(self) -> pd.DataFrame:
         path = self.run_dir / FIRST_WINDOW_TRAINING_BANK_FILE
+        remote_store.ensure(path)
         if not path.exists():
             raise FileNotFoundError(f"{self.display_name} has no first-window training bank (not a long / ewma run, or saved before it existed).")
         return pd.read_parquet(path)
@@ -1351,11 +1357,14 @@ class TrainedInitialRun(Run):
         return build_first_window_training_bank(self._fits)
 
 
-def reweight_blocker(run: Run) -> str | None:
-    """Why the run's per-ticker forecasts cannot be read for other weights (None = they can)."""
-    if not run.has_ewma_bank:
+def reweight_blocker(run: Run, *, check_banks: bool = True) -> str | None:
+    """
+    Why the run's per-ticker forecasts cannot be read for other weights (None = they can). check_banks=False leaves out the two questions about the banks
+    being on disk: a run whose reweighted residuals are already saved (StoredVirtualRun) does not open them to be read.
+    """
+    if check_banks and not run.has_ewma_bank:
         return "it has no per-ticker forecasts (a wide model or the historical VaR)"
-    if not run.has_first_window_training_bank:
+    if check_banks and not run.has_first_window_training_bank:
         return "its first-window training bank is not saved (run tools/backfill_first_window_training_bank.py)"
     recipe = run.recipe
     if recipe.model_family == "xgboost" and "MarketEwmaVol" in recipe.features.portfolio_dependent_blocks:
@@ -1380,8 +1389,8 @@ class ReweightedVirtualRun(Run):
     '<model> | <portfolio name> | train N f M', without it '<base label> | user defined weights'.
     """
 
-    def __init__(self, base: Run, weights: dict[str, float], portfolio: dict | None = None):
-        blocker = reweight_blocker(base)
+    def __init__(self, base: Run, weights: dict[str, float], portfolio: dict | None = None, *, check_banks: bool = True):
+        blocker = reweight_blocker(base, check_banks=check_banks)
         if blocker:
             raise ValueError(f"{base.display_name} cannot be re-weighted: {blocker}.")
         tickers = list(base.config["setting"]["tickers"])
@@ -1471,7 +1480,7 @@ class StoredVirtualRun(ReweightedVirtualRun):
     """
 
     def __init__(self, base: Run, weights: dict[str, float], root: Path, portfolio: dict | None = None):
-        super().__init__(base, weights, portfolio)
+        super().__init__(base, weights, portfolio, check_banks=False)     # saved when the banks were there; reading the saved residuals does not need them (the results cache has none)
         self.root = Path(root)
 
     @cached_property
